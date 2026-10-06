@@ -2,7 +2,7 @@
 
 Setup, tooling, feature gates, cross-cutting notes
 
-Count: **27**
+Count: **28**
 
 - [`2026-05-12-setup.md`](2026-05-12-setup.md)
 - [`2026-05-13-airi-desktop-reuse.md`](2026-05-13-airi-desktop-reuse.md)
@@ -30,7 +30,8 @@ Count: **27**
 - [`2026-07-03-qodana-operating-model.md`](2026-07-03-qodana-operating-model.md)
 - [`2026-07-07-inference-task-object-detection-simplification-plan.md`](2026-07-07-inference-task-object-detection-simplification-plan.md)
 - [`2026-09-23-crates-io-publication-reference.md`](2026-09-23-crates-io-publication-reference.md)
-- [`2026-10-05-osworld-kubernetes-runbook.md`](2026-10-05-osworld-kubernetes-runbook.md): Operator runbook for booting retained OSWorld V1/V2.1 qcow2 images on ihome, installing AUV, exercising both control topologies, and rerunning fixed V1 scripted tasks.
+- [`2026-10-07-kubernetes-kvm-x11-auv-runbook.md`](2026-10-07-kubernetes-kvm-x11-auv-runbook.md): Parameterized runbook for KVM, X11, noVNC, AUV daemon readiness, and Device pairing on Kubernetes.
+- [`2026-10-07-osworld-on-kubernetes-workflow.md`](2026-10-07-osworld-on-kubernetes-workflow.md): Responsibility split and episode flow for evaluating OSWorld tasks through AUV.
 
 ## Related
 
