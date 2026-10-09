@@ -264,6 +264,12 @@ mod native {
   static ACTIVE_SESSION: Mutex<Option<CachedSession>> = Mutex::new(None);
   static HEALTH_SESSION: Mutex<Option<CachedSession>> = Mutex::new(None);
 
+  pub fn take_health_session() {
+    if let Ok(mut session) = HEALTH_SESSION.lock() {
+      session.take();
+    }
+  }
+
   fn try_get_next_frame(
     frame_pool: &Direct3D11CaptureFramePool,
   ) -> DriverResult<Option<windows::Graphics::Capture::Direct3D11CaptureFrame>> {
@@ -454,6 +460,11 @@ mod native {
           let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
           ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(|e| backend(format!("failed to map staging texture: {e}")))?;
 
+          if mapped.pData.is_null() {
+            ctx.Unmap(&staging, 0);
+            return Err(backend("D3D11 mapped staging texture pData is null"));
+          }
+
           let width = desc.Width as usize;
           let height = desc.Height as usize;
           let row_pitch = mapped.RowPitch as usize;
@@ -514,6 +525,11 @@ mod native {
     item: &GraphicsCaptureItem,
     timeout: Duration,
   ) -> DriverResult<WindowHealth> {
+    let hwnd = HWND(target_id as _);
+    if unsafe { !windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() } {
+      return Err(backend("target window no longer exists (destroyed)"));
+    }
+
     let size = item.Size().map_err(|e| backend(format!("failed to read GraphicsCaptureItem size: {e}")))?;
 
     if size.Width <= 0 || size.Height <= 0 {
@@ -605,6 +621,11 @@ mod native {
 
           let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
           ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(|e| backend(format!("failed to map staging texture: {e}")))?;
+
+          if mapped.pData.is_null() {
+            ctx.Unmap(&staging, 0);
+            return Err(backend("D3D11 mapped staging texture pData is null"));
+          }
 
           let width = desc.Width as usize;
           let height = desc.Height as usize;
@@ -916,6 +937,15 @@ mod native {
     };
 
     while !stop_flag.load(Ordering::SeqCst) {
+      if unsafe { !windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() } {
+        break;
+      }
+      let mut current_pid = 0u32;
+      let tid = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, Some(&mut current_pid)) };
+      if tid == 0 || current_pid != key.pid {
+        break;
+      }
+
       // 1. Idle timeout check (250ms)
       let mut superseded = false;
       let mut idle = false;
@@ -1194,7 +1224,7 @@ pub fn capture_window_health_cached(window: &Window) -> DriverResult<WindowHealt
   // 2. Slow path: ensure worker is started and wait for fresh sample
   native::ensure_worker_started(&key)?;
 
-  let deadline = Instant::now() + Duration::from_millis(50);
+  let deadline = Instant::now() + Duration::from_millis(200);
   let mut guard = native::lock_health_state();
   let mut wait_success = false;
 
@@ -1236,6 +1266,7 @@ pub fn capture_window_health_cached(window: &Window) -> DriverResult<WindowHealt
     (Ok(h), false, Some("stale_sample".to_string()))
   } else {
     drop(guard);
+    native::take_health_session();
     let health = capture_window_health_unserialized(window)?;
     if !health.is_fresh {
       return Err(backend("fresh WGC health sample unavailable"));
@@ -1330,7 +1361,7 @@ pub fn capture_window_health_strict(window: &Window) -> DriverResult<WindowHealt
   // 2. Slow path: ensure worker running and wait for fresh sample
   native::ensure_worker_started(&key)?;
 
-  let deadline = Instant::now() + Duration::from_millis(60);
+  let deadline = Instant::now() + Duration::from_millis(250);
   let mut guard = native::lock_health_state();
 
   while Instant::now() < deadline {
@@ -1370,7 +1401,35 @@ pub fn capture_window_health_strict(window: &Window) -> DriverResult<WindowHealt
     }
   }
 
-  Err(backend("fresh WGC health sample unavailable"))
+  drop(guard);
+  native::take_health_session();
+  let health = capture_window_health_unserialized(window)?;
+  if !health.is_fresh {
+    return Err(backend("fresh WGC health sample unavailable"));
+  }
+  let mut guard = native::lock_health_state();
+  let state = native::get_or_init_state(&mut guard);
+  if state.target_key.as_ref() == Some(&key) {
+    state.cached_entry = Some(HealthCacheEntry {
+      health: health.clone(),
+      captured_at: Instant::now(),
+      sample_duration: Duration::ZERO,
+      target_size: (key.width, key.height),
+    });
+  }
+
+  let elapsed_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+  let target_name = window.app_name.as_deref().or(window.title.as_deref());
+  let details =
+    format!("cache_hit=false;age_ms=0.0;refresh_ms=0.0;target={};kind=strict;sync_fallback=true", target_name.unwrap_or("unknown"));
+  crate::latency::record_latency_event(
+    "capture_window_health_strict",
+    elapsed_ms,
+    Some((health.width, health.height)),
+    Some(WGC_BACKEND),
+    Some(&details),
+  );
+  Ok(health)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1529,10 +1588,14 @@ pub fn inject_health_cache_entry(key: HealthCacheKey, health: WindowHealth, age:
   });
 }
 
-#[cfg(all(test, target_os = "windows"))]
+/// Explicitly clears the health cache and requests any active health worker to terminate.
+#[cfg(target_os = "windows")]
 pub fn clear_health_cache() {
   native::clear_health_cache();
 }
+
+#[cfg(not(target_os = "windows"))]
+pub fn clear_health_cache() {}
 
 // The tests drive Direct3D and WGC directly, so they only build on Windows.
 #[cfg(all(test, target_os = "windows"))]
