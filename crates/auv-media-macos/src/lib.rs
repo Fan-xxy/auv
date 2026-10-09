@@ -145,6 +145,7 @@ struct AdapterGet {
   album: Option<String>,
   duration: Option<f64>,
   elapsed_time: Option<f64>,
+  elapsed_time_now: Option<f64>,
   playback_rate: Option<f64>,
   content_item_identifier: Option<String>,
   supports_is_liked: Option<bool>,
@@ -166,7 +167,7 @@ fn parse_get(json: &str) -> Result<NowPlayingState, MediaError> {
     artist: item.artist,
     album: item.album,
     duration_seconds: item.duration,
-    elapsed_seconds: item.elapsed_time,
+    elapsed_seconds: item.elapsed_time_now.or(item.elapsed_time),
     playback_rate: item.playback_rate,
     is_playing: item.playing,
     content_item_id: item.content_item_identifier,
@@ -259,3 +260,7 @@ pub fn seek(position: std::time::Duration) -> Result<(), MediaError> {
 pub fn seek(position: std::time::Duration) -> Result<(), MediaError> {
   tracing::seek(position, || Err(MediaError::Unsupported))
 }
+
+#[cfg(test)]
+#[path = "lib_test.rs"]
+mod tests;

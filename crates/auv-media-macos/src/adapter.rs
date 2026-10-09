@@ -96,7 +96,7 @@ fn run_adapter(args: &[&str]) -> Result<String, MediaError> {
 /// Run the adapter `get` command, returning its raw JSON stdout (`null` when
 /// nothing is playing).
 pub(crate) fn run_now_playing_get() -> Result<String, MediaError> {
-  run_adapter(&["get"])
+  run_adapter(&["get", "--now"])
 }
 
 /// Send a MediaRemote command by its numeric MRCommand id.
