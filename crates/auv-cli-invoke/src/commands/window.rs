@@ -221,7 +221,7 @@ struct FindWindowTextArgs {
   id = "window.findText",
   target = OptionalApplication,
   group = "window",
-  description = "Capture a resolved window and locate OCR text anchors in window pixel space.",
+  description = "Capture a resolved window and locate OCR text anchors in logical screen coordinates.",
   input = FindWindowTextArgs,
 )]
 async fn find_window_text(input: InvokeCommandInput, args: FindWindowTextArgs) -> InvokeCommandResult {
