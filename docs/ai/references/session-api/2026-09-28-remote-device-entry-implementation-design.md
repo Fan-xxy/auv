@@ -1,5 +1,12 @@
 # Remote Device unlock: existing locked sessions first
 
+> NOTICE (2026-10-11): Session access commands now live under `auv devices
+> access`: `sessions list|lock|unlock` (formerly `devices sessions`,
+> `devices lock`, `devices unlock`), `enrollments add|get|list|remove`
+> (formerly `auv device-local enroll|get|list|remove`, now without `--kind`),
+> `policy status|enable|disable` (formerly `auv device-local policy`), and
+> `audit list`. Commands below are kept as recorded.
+
 Status: owner-approved implementation design as of 2026-09-28, not a support
 claim. The first native Device release targets an **already logged-in OS
 session that was subsequently locked** on macOS, Debian GNOME, and Windows. An

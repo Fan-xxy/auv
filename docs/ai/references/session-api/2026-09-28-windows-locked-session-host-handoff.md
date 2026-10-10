@@ -1,5 +1,12 @@
 # Windows locked-session host handoff
 
+> NOTICE (2026-10-11): Session access commands now live under `auv devices
+> access`: `sessions list|lock|unlock` (formerly `devices sessions`,
+> `devices lock`, `devices unlock`), `enrollments add|get|list|remove`
+> (formerly `auv device-local enroll|get|list|remove`, now without `--kind`),
+> `policy status|enable|disable` (formerly `auv device-local policy`), and
+> `audit list`. Commands below are kept as recorded.
+
 Status: one installed-host, owner-observed locked-console gate passed on
 2026-09-29. Isolated Windows native builds and focused unit tests passed for
 the driver, service mode, DeviceLocalService transport, and restricted

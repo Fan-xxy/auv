@@ -19,7 +19,8 @@ still use the existing common result names. An explicit operation field needs
 a persisted-record and local-read contract change and is deferred at the
 `AuditAttempt` call site.
 
-The CLI `devices lock` and MCP `device_ensure_user_session_locked` use the same
+The CLI `devices access sessions lock` (`devices lock` before 2026-10-11) and MCP
+`device_ensure_user_session_locked` use the same
 typed Rust operation. The protobuf method remains gRPC-only like the initial
 unlock method. A validated HTTP request/OpenAPI contract is deferred; see the
 inline `TODO(device-entry-http)` at the RPC.
@@ -71,9 +72,11 @@ same broad target authority as the earlier bearer.
 For a new controller, the normal flow is:
 
 1. The target owner installs and starts its daemon and, if needed, enrolls the
-   target OS account with `auv device-local enroll --user USER --kind
-   os-password` in a target-local terminal. The hidden credential prompt stays
-   on the target. Windows PIN enrollment uses `--kind windows-pin`.
+   target OS account with `auv devices access enrollments add --user USER` in
+   a target-local terminal (named `auv device-local enroll --kind …` before
+   2026-10-11). The hidden credential prompt stays on the target. The CLI asks
+   for the login password on macOS and Linux and for the Windows PIN on
+   Windows.
 2. For the first pairing, the target owner runs `auv devices pair create-token
    --ttl 300` against its local daemon. An already paired controller may issue
    a later token remotely under the current delegation policy. The token is
@@ -85,15 +88,17 @@ For a new controller, the normal flow is:
    shell history or process listings; a stdin/file input is a candidate next
    slice.
 4. A newly enrolled account is `PENDING`. The paired controller may remotely
-   `devices lock` its `USABLE` desktop. That operation does not read the stored
-   credential or promote enrollment. The first successful `devices unlock`
+   `devices access sessions lock` its `USABLE` desktop. That operation does not read
+   the stored credential or promote enrollment. The first successful
+   `devices access sessions unlock`
    probes the locked host credential and promotes the account to `READY`.
    This first-use sequence has a policy regression test; a new enrollment on
    each installed platform has not yet been live-tested with this change.
 5. The controller runs `auv devices list`, selects the target by stable Device
-   ID, and runs `auv --device-id ID devices sessions`. Subsequent `devices
-   lock` and `devices unlock` calls use exactly one `--user USER` or fresh
-   `--session SELECTOR`; success requires same-session state readback.
+   ID, and runs `auv --device-id ID devices access sessions list`. Subsequent
+   `devices access sessions lock` and `devices access sessions unlock` calls use
+   exactly one `--user USER` or fresh `--session SELECTOR`; success requires
+   same-session state readback.
 
 Pairing grants current broad Device authority, not an unlock-specific grant.
 The target owner can disable or unpair a controller; removing an OS enrollment

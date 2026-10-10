@@ -6,7 +6,7 @@ use clap::{ArgGroup, Args, Subcommand};
 
 #[derive(Clone, Debug, Args)]
 #[command(
-  after_long_help = "Examples:\n  # List local and paired Devices\n  auv devices list\n\n  # Inspect one Device by its stable ID\n  auv devices get <DEVICE_ID>\n\n  # List current OS login sessions on a paired Device\n  auv --device <NAME> devices sessions\n\n  # Lock and unlock an existing OS login session\n  auv --device <NAME> devices lock --user neko\n  auv --device <NAME> devices unlock --user neko\n\n  # Learn the two-machine enrollment flow\n  auv devices pair --help\n\n  # Run the same typed operation on a paired Device\n  auv --device <NAME> invoke display.list"
+  after_long_help = "Examples:\n  # List local and paired Devices\n  auv devices list\n\n  # Inspect one Device by its stable ID\n  auv devices get <DEVICE_ID>\n\n  # List current OS login sessions on a paired Device\n  auv --device <NAME> devices access sessions list\n\n  # Lock and unlock an existing OS login session\n  auv --device <NAME> devices access sessions lock --user neko\n  auv --device <NAME> devices access sessions unlock --user neko\n\n  # On the Device to unlock: enroll its login credential once\n  auv devices access enrollments add --user neko\n\n  # Learn the two-machine enrollment flow\n  auv devices pair --help\n\n  # Run the same typed operation on a paired Device\n  auv --device <NAME> invoke display.list"
 )]
 pub struct DevicesArgs {
   #[command(subcommand)]
@@ -20,12 +20,9 @@ pub enum DevicesCommand {
   List(DeviceListArgs),
   /// Get one Device by stable ID.
   Get(DeviceGetArgs),
-  /// List current OS login sessions (requires a validated native entry host).
-  Sessions(DeviceSessionsArgs),
-  /// Unlock an existing OS login session (requires a validated native host).
-  Unlock(DeviceSessionTargetArgs),
-  /// Lock an existing usable OS login session and verify its final state.
-  Lock(DeviceSessionTargetArgs),
+  /// Session access: list, lock and unlock OS login sessions, and manage the
+  /// enrollments, policy and audit that govern it.
+  Access(AccessArgs),
   /// Establish or administer paired Device trust.
   #[command(
     long_about = "Pairing is a two-machine enrollment flow. The daemon host creates a short, one-time bootstrap token locally. The client consumes that token once, receives an opaque Device credential, and saves it in a named local profile.\n\nRegistration is deliberately local to the daemon host: a remote unauthenticated caller cannot create pairing tokens. After enrollment, normal AUV commands select the paired Device and reuse the saved credential automatically."
@@ -39,6 +36,44 @@ pub enum DevicesCommand {
   Disable(DeviceTrustArgs),
   /// Manage configured paired Device profiles (provisional).
   Profiles(DeviceProfilesArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+#[command(
+  after_long_help = "`sessions` acts on the selected Device (`--device`) and needs a supported unlock host there; `sessions lock` and `sessions unlock` also need an enrolled OS account on that Device. `enrollments`, `policy` and `audit` run only on this Device, because a credential is typed on the Device it unlocks and never crosses the network.\n\nExamples:\n  # On the Device to unlock\n  auv devices access enrollments add --user neko\n  auv devices access policy status\n\n  # From a paired controller\n  auv --device <NAME> devices access sessions list\n  auv --device <NAME> devices access sessions lock --user neko\n  auv --device <NAME> devices access sessions unlock --user neko"
+)]
+pub struct AccessArgs {
+  #[command(subcommand)]
+  pub command: AccessCommand,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum AccessCommand {
+  /// List, lock and unlock existing OS login sessions on the selected Device.
+  Sessions(SessionsArgs),
+  /// Manage enrolled login credentials for remote unlock (this Device only).
+  Enrollments(crate::commands::device_local::EnrollmentsArgs),
+  /// Show or change whether paired Devices may list, lock and unlock sessions
+  /// on this Device (this Device only).
+  Policy(crate::commands::device_local::AccessPolicyArgs),
+  /// Read this Device's session access audit records (this Device only).
+  Audit(crate::commands::device_local::AuditArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SessionsArgs {
+  #[command(subcommand)]
+  pub command: SessionsCommand,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SessionsCommand {
+  /// List existing OS login sessions on the selected Device.
+  List(DeviceSessionsArgs),
+  /// Lock an existing usable OS login session and verify its final state.
+  Lock(DeviceSessionTargetArgs),
+  /// Unlock an existing OS login session with that Device's enrolled credential.
+  Unlock(DeviceSessionTargetArgs),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -144,7 +179,7 @@ pub struct DeviceSessionTargetArgs {
   /// OS account with one existing session on the selected Device.
   #[arg(long, required_unless_present = "session", conflicts_with = "session")]
   pub user: Option<String>,
-  /// Opaque selector from `auv devices sessions`.
+  /// Opaque selector from `auv devices access sessions list`.
   #[arg(long, required_unless_present = "user")]
   pub session: Option<String>,
   /// Override daemon discovery with an explicit endpoint.
@@ -186,19 +221,45 @@ struct UserSessionTableRow {
   seat: Option<String>,
 }
 
-pub async fn run(args: DevicesArgs, selection: &auv::selection::RootSelection) -> Result<i32, String> {
+pub async fn run(args: DevicesArgs, selection: &auv::selection::RootSelection, project_root: &std::path::Path) -> Result<i32, String> {
+  use crate::commands::device_local::LocalRequest;
+
   match args.command {
     DevicesCommand::List(args) => list(args, selection).await,
     DevicesCommand::Get(args) => get(args, selection).await,
-    DevicesCommand::Sessions(args) => sessions(args, selection).await,
-    DevicesCommand::Unlock(args) => change_lock_state(args, selection, false).await,
-    DevicesCommand::Lock(args) => change_lock_state(args, selection, true).await,
+    DevicesCommand::Access(args) => match args.command {
+      AccessCommand::Sessions(args) => match args.command {
+        SessionsCommand::List(args) => sessions(args, selection).await,
+        SessionsCommand::Lock(args) => change_lock_state(args, selection, true).await,
+        SessionsCommand::Unlock(args) => change_lock_state(args, selection, false).await,
+      },
+      AccessCommand::Enrollments(args) => {
+        local(selection, args.store.store_root, LocalRequest::Enrollments(args.command), project_root).await
+      }
+      AccessCommand::Policy(args) => local(selection, args.store.store_root, LocalRequest::Policy(args.command), project_root).await,
+      AccessCommand::Audit(args) => local(selection, args.store.store_root, LocalRequest::Audit(args.command), project_root).await,
+    },
     DevicesCommand::Pair(args) => pairing(args, selection).await,
     DevicesCommand::Unpair(args) => trust(args, selection, TrustAction::Unpair).await,
     DevicesCommand::Enable(args) => trust(args, selection, TrustAction::Enable).await,
     DevicesCommand::Disable(args) => trust(args, selection, TrustAction::Disable).await,
     DevicesCommand::Profiles(args) => profiles(args),
   }
+}
+
+/// Enrollments, the access policy and its audit stay with the Device they protect:
+/// a credential is typed on that Device's terminal and never crosses the
+/// network, so these commands do not follow Device or Run selection.
+async fn local(
+  selection: &auv::selection::RootSelection,
+  store_root: Option<std::path::PathBuf>,
+  request: crate::commands::device_local::LocalRequest,
+  project_root: &std::path::Path,
+) -> Result<i32, String> {
+  if selection.device_name.is_some() || selection.device_id.is_some() || selection.run_id.is_some() {
+    return Err("this command runs only on this Device; it cannot use --device, --device-id, or --run".to_string());
+  }
+  crate::commands::device_local::run(store_root.as_deref(), request, project_root).await
 }
 
 async fn list(args: DeviceListArgs, selection: &auv::selection::RootSelection) -> Result<i32, String> {
