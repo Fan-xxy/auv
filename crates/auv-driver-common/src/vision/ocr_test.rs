@@ -136,3 +136,46 @@ fn ocr_matches_share_action_point_and_best_match_contract() {
 
   assert_eq!(matched.action_point(), Point::new(25.0, 40.0));
 }
+
+// ROOT CAUSE:
+//
+// If the query and the OCR text spell punctuation differently, find_contains
+// missed visible text because it only lowercased both sides. Vision on macOS
+// reports `“Report — Final”` as `"Report - Final"`, so a query copied from the
+// screen with typographic punctuation found nothing; Tesseract splits
+// `Huashan.jpg` into `Huashan. jpg`.
+//
+// The fix folds quotes, dashes, whitespace and the OCR spacing around `.`/`,`
+// on both sides before matching, without joining sentence or list boundaries.
+#[test]
+fn find_contains_matches_across_ocr_punctuation_variants() {
+  let recognition = TextRecognition {
+    origin: None,
+    text: String::new(),
+    regions: [
+      "Open \"Report - Final\"",
+      "File: Huashan. jpg",
+      "Search for ‘youtube’ now",
+    ]
+    .into_iter()
+    .map(|text| RecognizedText {
+      text: text.into(),
+      bounds: Rect::new(0.0, 0.0, 10.0, 10.0),
+      confidence: None,
+    })
+    .collect(),
+  };
+  for query in ["“Report — Final”", "huashan.jpg", "'youtube'"] {
+    assert_eq!(recognition.find_contains(query).len(), 1, "{query}");
+  }
+  assert!(recognition.find_contains("  ").is_empty());
+}
+
+#[test]
+fn normalize_match_text_keeps_sentence_and_list_boundaries() {
+  assert_eq!(normalize_match_text("File: Huashan. jpg"), "file: huashan.jpg");
+  assert_eq!(normalize_match_text("Open  “Report — Final” ,now"), "open \"report - final\",now");
+  assert_eq!(normalize_match_text("For example. Commands"), "for example. commands");
+  assert_eq!(normalize_match_text("Chapter 1. 5 items"), "chapter 1. 5 items");
+  assert_eq!(normalize_match_text("a, b"), "a, b");
+}
