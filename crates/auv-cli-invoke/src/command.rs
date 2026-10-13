@@ -430,10 +430,58 @@ impl InvokeCommand {
     if let Err(error) = input.cancellation.check() {
       return Box::pin(async move { Err(error.to_string().into()) });
     }
-    if let Err(error) = self.target.validate(&input) {
-      return Box::pin(async move { Err(InvokeFailure::new(FailureCode::InvalidTarget, error)) });
+    if let Err(failure) = self.validate(&input) {
+      return Box::pin(async move { Err(failure) });
     }
     (self.handler)(input)
+  }
+
+  /// Checks the target and the protocol input keys before any frontend runs
+  /// the command locally or routes it to a Runner.
+  pub fn validate(&self, input: &InvokeCommandInput) -> Result<(), InvokeFailure> {
+    self.target.validate(input).map_err(|message| InvokeFailure::new(FailureCode::InvalidTarget, message))?;
+    self.validate_input_keys(input).map_err(|message| InvokeFailure::new(FailureCode::InvalidInput, message))
+  }
+
+  /// Rejects protocol input keys that the command does not declare.
+  ///
+  /// Protocol callers (MCP, Runner, library) pass `inputs` as a free-form map
+  /// that serde decodes leniently, so a misspelled or invented key such as
+  /// `timeout` was dropped and the command ran with its default. CLI calls
+  /// carry clap-parsed `typed_args`, which clap already checked.
+  fn validate_input_keys(&self, input: &InvokeCommandInput) -> Result<(), String> {
+    if input.typed_args.is_some() {
+      return Ok(());
+    }
+    let mut accepted = self.input_arguments().iter().map(input_key).collect::<Vec<_>>();
+    // NOTICE: `target` stays accepted as an input key because
+    // `InvokeCommandInput::application_target` falls back to it when a protocol
+    // caller leaves the top-level target empty.
+    if self.target != TargetPolicy::Forbidden {
+      accepted.push("target".to_string());
+    }
+    // `overlay` is the protocol spelling of `--no-overlay` (see `crate::parse_cli`);
+    // it is a presentation switch, so error messages do not advertise it.
+    let unknown = input.inputs.keys().filter(|key| *key != "overlay" && !accepted.contains(key)).map(String::as_str).collect::<Vec<_>>();
+    if unknown.is_empty() {
+      return Ok(());
+    }
+    Err(format!(
+      "{} does not accept input {}; accepted inputs: {}",
+      self.id,
+      unknown.join(", "),
+      if accepted.is_empty() {
+        "none".to_string()
+      } else {
+        accepted.join(", ")
+      },
+    ))
+  }
+
+  /// The command-local arguments a protocol caller may pass as `inputs`,
+  /// each keyed by [`input_key`].
+  pub fn input_arguments(&self) -> Vec<Arg> {
+    self.clap_command().get_arguments().filter(|argument| argument.get_id() != "help").cloned().collect()
   }
 
   pub fn clap_command(&self) -> Command {
@@ -443,6 +491,12 @@ impl InvokeCommand {
   pub fn parse_cli_args(&self, arguments: &[String]) -> Result<InvokeCommandCliParse, String> {
     (self.typed_parse)(self.id, self.description, self.target, arguments)
   }
+}
+
+/// The protocol `inputs` key of a command argument: its long name, or its id
+/// for a positional argument. The MCP catalog and input validation share it.
+pub fn input_key(argument: &Arg) -> String {
+  argument.get_long().unwrap_or_else(|| argument.get_id().as_str()).to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -511,19 +565,9 @@ where
   if let Some(args) = input.typed_args.as_ref().and_then(TypedInvokeArgs::get::<T>) {
     return Ok(args.clone());
   }
-  let mut protocol_inputs = input.inputs.clone();
-  let command = T::augment_args(Command::new("invoke-command").disable_help_flag(true));
-  for argument in command.get_arguments() {
-    let Some(long) = argument.get_long() else {
-      continue;
-    };
-    let id = argument.get_id().as_str();
-    if !protocol_inputs.contains_key(long)
-      && let Some(value) = protocol_inputs.get(id).cloned()
-    {
-      protocol_inputs.insert(long.to_string(), value);
-    }
-  }
+  // Keys are the declared long names; `InvokeCommand::validate` rejects any other
+  // spelling before a handler decodes them.
+  let protocol_inputs = &input.inputs;
   let values = protocol_inputs.iter().map(|(name, value)| (name.as_str().into_deserializer(), ProtocolValue(value)));
   T::deserialize(MapDeserializer::<_, serde::de::value::Error>::new(values)).map_err(|error| error.to_string())
 }
