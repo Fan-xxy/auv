@@ -85,7 +85,6 @@ enum Xtask {
 
 pub async fn run_root() -> Result<i32, String> {
   let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-  init_diagnostics(verbosity(&arguments));
   run_os(arguments).await
 }
 
@@ -97,6 +96,7 @@ async fn run_os(arguments: Vec<OsString>) -> Result<i32, String> {
   let mut argv = Vec::with_capacity(arguments.len() + 1);
   argv.push(OsString::from("auv"));
   argv.extend(arguments);
+  let verbosity = verbosity(&argv[1..]);
   let parsed = match RootArgs::try_parse_from(argv) {
     Ok(parsed) => parsed,
     Err(error) => {
@@ -109,6 +109,10 @@ async fn run_os(arguments: Vec<OsString>) -> Result<i32, String> {
       };
     }
   };
+  // Only the daemon is long-lived enough to need a log file; its Runners open
+  // their own in `runner::run_if_internal`.
+  let log_file = matches!(parsed.command, Some(RootCommand::Serve(_))).then_some("daemon");
+  crate::logging::init(verbosity, log_file);
   let selection = auv::selection::RootSelection {
     device_name: parsed.device,
     device_id: parsed.device_id,
@@ -174,19 +178,6 @@ fn verbosity(arguments: &[OsString]) -> u8 {
       count
     }
   })
-}
-
-fn init_diagnostics(verbosity: u8) {
-  let level = match verbosity {
-    0 => return,
-    1 => "info",
-    2 => "debug",
-    _ => "trace",
-  };
-  // Keep dependency-level HTTP/gRPC tracing disabled: it may include request
-  // metadata or bodies containing bootstrap and bearer credentials.
-  let filter = tracing_subscriber::EnvFilter::new(format!("off,auv_cli={level}"));
-  let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).with_target(false).try_init();
 }
 
 pub fn help_text() -> String {
