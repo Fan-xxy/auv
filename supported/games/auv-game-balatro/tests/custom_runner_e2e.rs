@@ -28,6 +28,7 @@ async fn daemon_routes_the_app_owned_balatro_runner() {
       }),
     }],
     daemon_idle_timeout: None,
+    local_clients: auv_api_server::LocalClientPolicy::AnyProcessOfOsUser,
     first_party_runners: Default::default(),
   })
   .await

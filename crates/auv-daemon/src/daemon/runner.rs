@@ -540,6 +540,9 @@ async fn spawn_executable_ready(
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::inherit());
   if let Some(parent_context) = parent_context {
+    // TODO(runner-launcher-token): a LauncherOnly daemon rejects Runner
+    // callbacks through this context until Runners receive a token over a
+    // channel that, unlike the environment, other processes cannot read.
     command.env("AUV_CONTEXT", parent_context);
   }
   if let Some(working_directory) = &runtime.working_directory {
@@ -636,6 +639,9 @@ async fn spawn_executable_ready(
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::inherit());
   if let Some(parent_context) = parent_context {
+    // TODO(runner-launcher-token): a LauncherOnly daemon rejects Runner
+    // callbacks through this context until Runners receive a token over a
+    // channel that, unlike the environment, other processes cannot read.
     command.env("AUV_CONTEXT", parent_context);
   }
   if let Some(working_directory) = &runtime.working_directory {

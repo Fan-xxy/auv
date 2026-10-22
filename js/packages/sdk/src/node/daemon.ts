@@ -6,7 +6,7 @@ import type { AuvOverlayOptions, OverlayTheme } from './overlay'
 
 import process from 'node:process'
 
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
@@ -41,6 +41,13 @@ export interface AuvDaemon {
 
 /** Serializable defaults for connecting to the preferred bound endpoint. */
 export interface AuvDaemonConnectionOptions {
+  /**
+   * Launcher token generated for this launch under the `launcher-only`
+   * policy. The daemon rejects local callers that do not present it,
+   * including other processes of the same OS user. Absent under
+   * `any-process-of-os-user`.
+   */
+  readonly credential?: DeviceCredential
   readonly endpoint: string
   readonly local: boolean
   readonly transport: 'http' | 'npipe' | 'unix'
@@ -76,6 +83,9 @@ export interface AuvPlatformOptions {
   macos?: AuvMacosOptions
 }
 
+/** Which local processes may call a daemon over its Unix socket or named pipe. */
+export type LocalClientPolicy = 'any-process-of-os-user' | 'launcher-only'
+
 /** Options for starting one app-owned `auv serve` child process. */
 export interface StartAuvOptions extends OperationOptions {
   /**
@@ -85,7 +95,10 @@ export interface StartAuvOptions extends OperationOptions {
   binaryPath?: string
   /** Seconds without live Runners before the daemon exits. */
   daemonIdleTimeoutSeconds?: number
-  /** Path at which the daemon publishes discovery metadata. */
+  /**
+   * Path at which the daemon publishes discovery metadata. Setting it
+   * registers the daemon, so it cannot be combined with `noRegister: true`.
+   */
   discoveryFile?: string
   /** Environment values overlaid on the current Node.js process environment. */
   environment?: NodeJS.ProcessEnv
@@ -100,9 +113,19 @@ export interface StartAuvOptions extends OperationOptions {
    */
   listeners?: readonly string[]
   /**
+   * Which local processes may call the daemon over its Unix socket or named
+   * pipe. `launcher-only` admits only this process and those it hands
+   * `connectionOptions.credential` to; `any-process-of-os-user` admits every
+   * process of the current OS user, which can then use the screen and input
+   * permissions granted to your app. HTTP listeners always require pairing.
+   * @default 'launcher-only'
+   */
+  localClientPolicy?: LocalClientPolicy
+  /**
    * Keeps this child daemon from registering as the default local daemon: it
-   * publishes no discovery metadata.
-   * @default false
+   * publishes no discovery metadata. Discovery clients cannot use a
+   * registered `launcher-only` daemon without its launcher token.
+   * @default true, or false when `discoveryFile` is set
    */
   noRegister?: boolean
   /** Overlay presentation defaults for this daemon and its Runner children. */
@@ -147,7 +170,7 @@ type AuvChildProcess = Result
 interface ResolvedStartAuvOptions extends StartAuvOptions {
   binaryPath: string
   listeners: readonly string[]
-  noRegister: boolean
+  localClientPolicy: LocalClientPolicy
   runnerProviders: readonly string[]
   shutdownTimeoutMs: number
   startupTimeoutMs: number
@@ -195,7 +218,8 @@ export async function startAuv(options: StartAuvOptions = {}): Promise<AuvDaemon
     discoveryFile,
     environment,
     listeners,
-    noRegister,
+    localClientPolicy,
+    noRegister: configuredNoRegister,
     overlay,
     pairingStore,
     platforms,
@@ -208,13 +232,18 @@ export async function startAuv(options: StartAuvOptions = {}): Promise<AuvDaemon
   } = merge<ResolvedStartAuvOptions, StartAuvOptions>({
     binaryPath: 'auv',
     listeners: [],
-    noRegister: false,
+    localClientPolicy: 'launcher-only',
     runnerProviders: [],
     shutdownTimeoutMs: 5_000,
     startupTimeoutMs: 10_000,
     workingDirectory: process.cwd(),
   }, options)
 
+  if (configuredNoRegister === true && discoveryFile !== undefined)
+    throw new RangeError('discoveryFile registers the daemon and cannot be combined with noRegister: true')
+  if (localClientPolicy !== 'launcher-only' && localClientPolicy !== 'any-process-of-os-user')
+    throw new RangeError(`unknown localClientPolicy: ${String(localClientPolicy)}`)
+  const noRegister = configuredNoRegister ?? discoveryFile === undefined
   if (!Number.isFinite(startupTimeoutMs))
     throw new RangeError('startupTimeoutMs must be finite')
   if (startupTimeoutMs <= 0)
@@ -246,11 +275,15 @@ export async function startAuv(options: StartAuvOptions = {}): Promise<AuvDaemon
   }
 
   const id = randomUUID()
+  // Sent over stdin, never argv or the environment: other processes of the
+  // same user can read both.
+  const launcherToken = localClientPolicy === 'launcher-only' ? randomBytes(32).toString('hex') : undefined
   const child = x(binaryPath, serveArguments({
     daemonIdleTimeoutSeconds,
     discoveryFile,
     id,
     listeners: endpoints,
+    localClientPolicy,
     noRegister,
     pairingStore,
     runnerProviders,
@@ -274,6 +307,11 @@ export async function startAuv(options: StartAuvOptions = {}): Promise<AuvDaemon
     nodePath: false,
     signal,
   })
+  // A daemon that exits early closes this pipe; `exited` reports that, so a
+  // failed write must not become an unhandled stream error in the host.
+  child.process?.stdin?.on('error', () => {})
+  if (launcherToken !== undefined)
+    child.process?.stdin?.write(`${launcherToken}\n`)
 
   const startupDeadline = AbortSignal.timeout(startupTimeoutMs)
   const startupSignal = signal === undefined ? startupDeadline : AbortSignal.any([signal, startupDeadline])
@@ -307,14 +345,14 @@ export async function startAuv(options: StartAuvOptions = {}): Promise<AuvDaemon
       }),
     ])
 
-    const connectionOptions = ownerConnection(ownerEndpoint)
+    const connectionOptions = ownerConnection(ownerEndpoint, launcherToken)
     let stopping: Promise<AuvDaemonExit> | undefined
 
     return {
       binaryPath,
       connect(connectOptions = {}) {
         return connect({
-          credential: connectOptions.credential,
+          credential: connectOptions.credential ?? launcherToken,
           endpoint: connectionOptions.endpoint,
           local: connectionOptions.local,
           signal: connectOptions.signal,
@@ -359,19 +397,11 @@ function isOwnerEndpoint(endpoint: string): boolean {
   return endpoint.startsWith('unix://') || endpoint.startsWith('npipe://')
 }
 
-function ownerConnection(endpoint: string): AuvDaemonConnectionOptions {
-  if (endpoint.startsWith('npipe://')) {
-    return {
-      endpoint,
-      local: true,
-      transport: 'npipe',
-    }
-  }
-  return {
-    endpoint: endpoint.slice('unix://'.length),
-    local: true,
-    transport: 'unix',
-  }
+function ownerConnection(endpoint: string, credential: DeviceCredential | undefined): AuvDaemonConnectionOptions {
+  const withCredential = credential === undefined ? {} : { credential }
+  if (endpoint.startsWith('npipe://'))
+    return { ...withCredential, endpoint, local: true, transport: 'npipe' }
+  return { ...withCredential, endpoint: endpoint.slice('unix://'.length), local: true, transport: 'unix' }
 }
 
 /**
@@ -397,7 +427,7 @@ function serializeOverlayTheme(theme: OverlayTheme): string {
 }
 
 function serveArguments(options: StartAuvOptions & { id: string }): string[] {
-  const args = ['serve', '--id', options.id, '--exit-on-stdin-close']
+  const args = ['serve', '--id', options.id, '--exit-on-stdin-close', '--local-clients', options.localClientPolicy ?? 'launcher-only']
   for (const listener of options.listeners ?? [])
     args.push('--listen', listener)
 
