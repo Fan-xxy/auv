@@ -10,6 +10,45 @@ fn step_failure(step: &str, error: impl Into<crate::InvokeFailure>) -> crate::In
   failure
 }
 
+/// Refuses a non-dry runner-route dispatch whose declared Runner support for
+/// the selected Runner's platform is explicitly unsupported, before any
+/// capability RPC. A missing or `Unspecified` platform never refuses: without
+/// a Device fact the backend's UNIMPLEMENTED answer, typed by the shared
+/// failure mapping, stays the only fallback. The decision input is the
+/// daemon-reported platform of the selected device's own host, never the
+/// local OS.
+fn runner_platform_gate(
+  command_id: &str,
+  command: &crate::InvokeCommand,
+  platform: Option<auv::devices::DevicePlatform>,
+) -> Result<(), crate::InvokeFailure> {
+  let Some(platform) = platform else {
+    return Ok(());
+  };
+  let support_platform = match platform {
+    auv::devices::DevicePlatform::Macos => crate::support::Platform::Macos,
+    auv::devices::DevicePlatform::Linux => crate::support::Platform::Linux,
+    auv::devices::DevicePlatform::Windows => crate::support::Platform::Windows,
+    auv::devices::DevicePlatform::Unspecified => return Ok(()),
+  };
+  let Some(cells) = command.runner_cells() else {
+    // Fixture commands have no Runner route; the earlier no-route refusal
+    // owns that case, so the gate is not their business.
+    return Ok(());
+  };
+  if cells.on(support_platform).state == crate::support::SupportState::Unsupported {
+    return Err(crate::InvokeFailure::new(
+      crate::FailureCode::Unsupported,
+      format!(
+        "{command_id} has no {} Runner path; the declared Runner support for {} is unsupported",
+        support_platform.label(),
+        support_platform.label()
+      ),
+    ));
+  }
+  Ok(())
+}
+
 /// Reuse the existing polling policy for local OCR and selected Runner calls.
 /// Callers own capture and recognition, including cancellation between Driver calls.
 ///
@@ -94,6 +133,20 @@ async fn invoke_selected(input: crate::InvokeCommandInput, context: auv::AuvCont
         format!("{} has no Runner route; run it without a selected Run or Device", input.command_id),
       ));
     }
+    // A disabled overlay validates and answers locally without any capability
+    // RPC, so this early return must stay ahead of the platform gate: even a
+    // Runner platform without overlay support can still skip a showing.
+    if input.command_id.as_str().starts_with("overlay.") {
+      let plan = crate::commands::overlay::plan_overlay(&input)?;
+      if input.dry_run || !input.overlay_enabled()? {
+        return crate::commands::overlay::selected_overlay_output(&plan, false).map_err(Into::into);
+      }
+    }
+    // Dry runs keep their current remote-free behavior, so only a real
+    // dispatch refuses on a declared-unsupported Runner platform.
+    if !input.dry_run {
+      runner_platform_gate(&input.command_id, command, context.device_platform)?;
+    }
   }
 
   match input.command_id.as_str() {
@@ -115,12 +168,6 @@ async fn invoke_selected(input: crate::InvokeCommandInput, context: auv::AuvCont
   }
 
   let command_id = input.command_id.as_str();
-  if command_id.starts_with("overlay.") {
-    let plan = crate::commands::overlay::plan_overlay(&input)?;
-    if input.dry_run || !input.overlay_enabled()? {
-      return crate::commands::overlay::selected_overlay_output(&plan, false).map_err(Into::into);
-    }
-  }
 
   let auv = auv::Client::from_context(context).await?;
   let run = auv.run(Default::default()).await.map_err(|error| step_failure("resolve selected Run", error))?;
