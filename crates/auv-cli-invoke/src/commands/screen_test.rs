@@ -132,20 +132,58 @@ fn screen_text_commands_are_not_gated_out_on_windows() {
   }
 }
 
-// `screen.clickText` stays macOS-only (`TODO(invoke-screen-click-text-windows)`): it would move the
-// real cursor. It must say so, not click.
-#[cfg(target_os = "windows")]
+// ROOT CAUSE:
+//
+// If `screen.clickText` ran on a platform without a click path, the refusal
+// reached the caller as `command_failed`,
+// because the handler returned a plain `String` and `InvokeFailure::from(String)` assigns that code.
+//
+// Before the fix, a caller could not tell a platform without a path from a click that failed. The
+// fix keeps the refusal typed as `unsupported`, and the command still refuses instead of clicking.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[test]
-fn screen_click_text_stays_unavailable_on_windows() {
+fn screen_click_text_refuses_as_unsupported_without_a_platform_path() {
   let input = dry_run_text_input("screen.clickText", None);
 
-  let error =
-    futures_executor::block_on(click_screen_text_invoke_command().invoke(input)).expect_err("screen.clickText has no Windows path");
+  let error = futures_executor::block_on(click_screen_text_invoke_command().invoke(input)).expect_err("screen.clickText has no path here");
 
-  assert!(error.message.contains("only available on macOS"), "unexpected message: {}", error.message);
+  assert_eq!(error.code, crate::FailureCode::Unsupported, "unexpected refusal: {}", error.message);
+  assert!(error.message.contains("only available on macOS and Windows"), "unexpected message: {}", error.message);
+}
+
+// ROOT CAUSE:
+//
+// Windows has primary-display OCR and foreground clicks, but the local invoke
+// handler compiled both out. Validate the same command without opening a driver
+// session; the owned Windows receiver separately verifies actual click effects.
+#[cfg(target_os = "windows")]
+#[test]
+fn screen_click_text_validates_on_windows() {
+  let output = futures_executor::block_on(click_screen_text_invoke_command().invoke(dry_run_text_input("screen.clickText", None)))
+    .expect("Windows must reach screen click validation instead of Unsupported");
+  assert_eq!(output.result(), super::super::input::validation_only_output().result());
 }
 
 #[cfg(target_os = "windows")]
+#[test]
+fn screen_click_text_rejects_target_activation_before_windows_input() {
+  let error =
+    futures_executor::block_on(click_screen_text_invoke_command().invoke(dry_run_text_input("screen.clickText", Some("unrelated.exe"))))
+      .expect_err("screen OCR must not silently activate a target");
+  assert_eq!(error.code, crate::FailureCode::InvalidTarget);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn cancelled_screen_click_never_opens_the_desktop() {
+  let cancellation = InvokeCancellation::new();
+  cancellation.cancel();
+  let error = futures_executor::block_on(click_recognized_screen_text_with_cancellation("Absent".into(), &cancellation))
+    .expect_err("already cancelled before capture");
+  assert!(error.message.contains("cancelled"), "{error:?}");
+}
+
+#[cfg(not(target_os = "macos"))]
 fn dry_run_text_input(command_id: &str, target: Option<&str>) -> InvokeCommandInput {
   InvokeCommandInput {
     command_id: command_id.to_string(),
@@ -159,4 +197,42 @@ fn dry_run_text_input(command_id: &str, target: Option<&str>) -> InvokeCommandIn
 
 fn report_field<'a>(report: &'a InvokeReport, label: &str) -> &'a str {
   report.fields.iter().find(|field| field.label == label).map(|field| field.value.as_str()).expect("report field")
+}
+
+fn wait_input(pairs: &[(&str, &str)]) -> InvokeCommandInput {
+  InvokeCommandInput {
+    command_id: "screen.waitForText".into(),
+    target: None,
+    inputs: pairs.iter().map(|(key, value)| (key.to_string(), value.to_string())).collect(),
+    typed_args: None,
+    dry_run: false,
+    cancellation: Default::default(),
+  }
+}
+
+// ROOT CAUSE:
+//
+// If a page took longer than 5 s to show the text, screen.waitForText
+// failed: the wait budget was hard-coded. OSWorld agents passed `timeout`
+// keys that did not exist (49 calls, silently ignored) and saw the text
+// appear 10-85 s after failed waits.
+//
+// The fix accepts `timeout-ms`/`interval-ms` and defaults to 10 s.
+#[test]
+fn screen_wait_decodes_its_budget_from_protocol_inputs() {
+  let (query, options) = WaitForScreenTextArgs::decode(&wait_input(&[("query", "Ready")])).unwrap();
+  assert_eq!(query, "Ready");
+  assert_eq!(options.timeout, std::time::Duration::from_secs(10));
+  assert_eq!(options.poll_interval, std::time::Duration::from_millis(250));
+
+  let (_, options) = WaitForScreenTextArgs::decode(&wait_input(&[("query", "Ready"), ("timeout-ms", "30000")])).unwrap();
+  assert_eq!(options.timeout, std::time::Duration::from_secs(30));
+  // Protocol inputs use the advertised key only; `InvokeCommand::validate`
+  // rejects the `timeout_ms` id spelling before decoding (#363).
+}
+
+#[test]
+fn screen_wait_rejects_budgets_outside_the_supported_range() {
+  let error = WaitForScreenTextArgs::decode(&wait_input(&[("query", "Ready"), ("timeout-ms", "999999")])).unwrap_err();
+  assert!(error.contains("timeout-ms must be within 100..=120000"), "{error}");
 }

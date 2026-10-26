@@ -40,6 +40,7 @@ struct PointerPositionArgs {}
 #[invoke_command(
   id = "input.pointerPosition",
   support = { macos: Supported, linux: Unsupported("the portal cannot report the pointer position"), windows: Supported },
+  runner = Direct,
   group = "input",
   description = "Read the OS pointer position in logical screen coordinates without delivering input.",
   input = PointerPositionArgs,
@@ -86,6 +87,7 @@ struct MoveMouseArgs {
 #[invoke_command(
   id = "input.moveMouse",
   support = { macos: Supported, linux: Supported, windows: Supported },
+  runner = Direct,
   group = "input",
   description = "Move the pointer to a logical screen coordinate without activating it.",
   input = MoveMouseArgs,
@@ -189,6 +191,9 @@ pub struct ScrollPointResult {
 #[invoke_command(
   id = "input.scrollPoint",
   support = { macos: Unsupported("the driver exposes only window-owned scrolling"), linux: Supported, windows: Supported },
+  // The Runner-side ScrollPoint handler refuses macOS for the same window-owned-scrolling
+  // driver fact, so the route cells equal the direct cells.
+  runner = Direct,
   group = "input",
   description = "Scroll at a logical screen point by delta_x/delta_y pixels (positive delta_y scrolls down). Needs no target; use it when no app or window target is known.",
   input = ScreenScrollArgs,
@@ -248,28 +253,39 @@ struct FocusTextArgs {
   /// Text identifying the input to focus.
   #[arg(value_name = "TEXT")]
   query: String,
+  /// Accessibility path of the input, from an earlier focus result; when set it
+  /// selects the input instead of TEXT.
+  #[arg(long, value_name = "PATH")]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  candidate: Option<String>,
 }
 
 #[invoke_command(
   id = "input.focusText",
   support = { macos: Supported, linux: Unsupported, windows: Unsupported("the Windows driver has an accessibility tree and focus_node that this command does not use") },
+  // The Runner-side AccessibilityService handler is macOS-only; the refusal reason differs
+  // from the direct Windows note, so the route declares its own cells.
+  runner = {
+    macos: Supported,
+    linux: Unsupported("the Runner's accessibility service is macOS-only"),
+    windows: Unsupported("the Runner's accessibility service is macOS-only"),
+  },
   target = RequiredApplication,
   group = "input",
   description = "Focus a text input in a target app through accessibility, located by its visible text.",
   input = FocusTextArgs,
 )]
-async fn focus_text_input(input: InvokeCommandInput, _args: FocusTextArgs) -> InvokeCommandResult {
+async fn focus_text_input(input: InvokeCommandInput, args: FocusTextArgs) -> crate::InvokeExecutionResult {
   if input.dry_run {
     return Ok(InvokeCommandOutput::completed());
   }
   let app = input.application_target()?.ok_or_else(|| "input.focusText requires --target app:".to_string())?.to_string();
-  let query = input.inputs.get("query").cloned().unwrap_or_default();
-  let candidate = input.inputs.get("candidate").cloned().unwrap_or_default();
-  let result = focus_text(app, query, candidate.clone()).await?;
-  focus_text_output(&result, &candidate)
+  let candidate = args.candidate.unwrap_or_default();
+  let result = focus_text(app, args.query, candidate.clone()).await?;
+  Ok(focus_text_output(&result, &candidate)?)
 }
 
-pub async fn focus_text(app: String, query: String, candidate: String) -> Result<auv_driver::AxFocusResult, String> {
+pub async fn focus_text(app: String, query: String, candidate: String) -> Result<auv_driver::AxFocusResult, crate::InvokeFailure> {
   #[cfg(target_os = "macos")]
   {
     let session = auv::local::open().map_err(|error| error.to_string())?;
@@ -278,19 +294,21 @@ pub async fn focus_text(app: String, query: String, candidate: String) -> Result
     } else {
       auv_driver::AxTextSelector::Path(candidate)
     };
-    session
-      .accessibility()
-      .focus_text(auv_driver::FocusTextOptions {
-        app,
-        selector,
-        expected_role: None,
-      })
-      .map_err(|error| error.to_string())
+    Ok(
+      session
+        .accessibility()
+        .focus_text(auv_driver::FocusTextOptions {
+          app,
+          selector,
+          expected_role: None,
+        })
+        .map_err(|error| error.to_string())?,
+    )
   }
   #[cfg(not(target_os = "macos"))]
   {
     let _ = (app, query, candidate);
-    Err("input.focusText is only available on macOS".to_string())
+    Err(crate::InvokeFailure::new(crate::FailureCode::Unsupported, "input.focusText is only available on macOS"))
   }
 }
 
@@ -300,6 +318,11 @@ struct AxFocusTextArgs {
   /// Text identifying the input to focus.
   #[arg(value_name = "TEXT")]
   query: String,
+  /// Accessibility path of the input, from an earlier focus result; when set it
+  /// selects the input instead of TEXT.
+  #[arg(long, value_name = "PATH")]
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  candidate: Option<String>,
 }
 
 // NOTICE(input-ax-focus-text-alias): this command is a compatibility alias for
@@ -309,21 +332,25 @@ struct AxFocusTextArgs {
 #[invoke_command(
   id = "input.axFocusText",
   support = { macos: Supported, linux: Unsupported, windows: Unsupported("the Windows driver has an accessibility tree and focus_node that this command does not use") },
+  runner = {
+    macos: Supported,
+    linux: Unsupported("the Runner's accessibility service is macOS-only"),
+    windows: Unsupported("the Runner's accessibility service is macOS-only"),
+  },
   role = Alias("input.focusText"),
   target = RequiredApplication,
   group = "input",
   description = "Compatibility spelling of input.focusText; prefer input.focusText.",
   input = AxFocusTextArgs,
 )]
-async fn ax_focus_text_input(input: InvokeCommandInput, _args: AxFocusTextArgs) -> InvokeCommandResult {
+async fn ax_focus_text_input(input: InvokeCommandInput, args: AxFocusTextArgs) -> crate::InvokeExecutionResult {
   if input.dry_run {
     return Ok(InvokeCommandOutput::completed());
   }
   let app = input.application_target()?.ok_or_else(|| "input.axFocusText requires --target app:".to_string())?.to_string();
-  let query = input.inputs.get("query").cloned().unwrap_or_default();
-  let candidate = input.inputs.get("candidate").cloned().unwrap_or_default();
-  let result = focus_text(app, query, candidate.clone()).await?;
-  focus_text_output(&result, &candidate)
+  let candidate = args.candidate.unwrap_or_default();
+  let result = focus_text(app, args.query, candidate.clone()).await?;
+  Ok(focus_text_output(&result, &candidate)?)
 }
 
 #[derive(Clone, Debug, Args, serde::Serialize, serde::Deserialize)]
@@ -340,7 +367,8 @@ struct TypeTextArgs {
 
 #[invoke_command(
   id = "input.typeText",
-  support = { macos: Supported, linux: Partial("foreground delivery only; targeted delivery is unsupported"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  support = { macos: Supported, linux: Partial("focused target only; cannot focus or raise a window"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  runner = Direct,
   target = OptionalKeyboard,
   group = "input",
   description = "Type text into the active control through the platform input driver.",
@@ -379,7 +407,8 @@ struct PasteTextArgs {
 
 #[invoke_command(
   id = "input.pasteText",
-  support = { macos: Supported, linux: Partial("foreground delivery only; targeted delivery is unsupported"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  support = { macos: Supported, linux: Partial("focused target only; cannot focus or raise a window"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  runner = Direct,
   target = OptionalKeyboard,
   group = "input",
   description = "Paste text into the active control through the clipboard, then restore the prior clipboard snapshot.",
@@ -454,7 +483,8 @@ struct PressKeysArgs {
   group = "input",
   description = "Press and release one key combination such as [\"ctrl\",\"l\"], optionally repeated. Keys are released in reverse order; effects remain unverified.",
   input = PressKeysArgs,
-  support = { macos: Supported, linux: Partial("foreground delivery only; targeted delivery is unsupported"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  support = { macos: Supported, linux: Partial("focused target only; cannot focus or raise a window"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  runner = Direct,
 )]
 async fn press_keys(input: InvokeCommandInput, args: PressKeysArgs) -> crate::InvokeExecutionResult {
   execute_keyboard(&input, vec![args.into()])
@@ -468,7 +498,8 @@ async fn press_keys(input: InvokeCommandInput, args: PressKeysArgs) -> crate::In
   group = "input",
   description = "Press and release one key combination such as [\"ctrl\",\"l\"], optionally repeated. Equivalent to input.keys.",
   input = PressKeysArgs,
-  support = { macos: Supported, linux: Partial("foreground delivery only; targeted delivery is unsupported"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  support = { macos: Supported, linux: Partial("focused target only; cannot focus or raise a window"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  runner = Direct,
   role = Alias("input.keys"),
 )]
 async fn press_keys_named(input: InvokeCommandInput, args: PressKeysArgs) -> crate::InvokeExecutionResult {
@@ -519,6 +550,7 @@ impl HoldKeysArgs {
   description = "Hold one key combination for a bounded duration, then release it. Delivery does not verify application effects.",
   input = HoldKeysArgs,
   support = { macos: Supported, linux: Partial("foreground delivery only; targeted delivery is unsupported"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  runner = Direct,
 )]
 async fn hold_keys(input: InvokeCommandInput, args: HoldKeysArgs) -> crate::InvokeExecutionResult {
   let (keys, policy, duration) = args.validated(input.target.is_some())?;
@@ -597,7 +629,8 @@ enum KeyboardActionArg {
   group = "input",
   description = "Execute ordered keyboard actions. Stops on failure with partial progress; delivery does not verify control effects.",
   input = InputKeyboardArgs,
-  support = { macos: Supported, linux: Partial("foreground delivery only; targeted delivery is unsupported"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  support = { macos: Supported, linux: Partial("focused target only; cannot focus or raise a window"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  runner = Direct,
 )]
 async fn input_keyboard(input: InvokeCommandInput, args: InputKeyboardArgs) -> crate::InvokeExecutionResult {
   let actions = args.into_keyboard_inputs().map_err(|message| crate::InvokeFailure::new(crate::FailureCode::InvalidInput, message))?;
@@ -606,7 +639,8 @@ async fn input_keyboard(input: InvokeCommandInput, args: InputKeyboardArgs) -> c
 
 #[invoke_command(
   id = "input.key",
-  support = { macos: Supported, linux: Partial("foreground delivery only; targeted delivery is unsupported"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  support = { macos: Supported, linux: Partial("focused target only; cannot focus or raise a window"), windows: Partial("foreground delivery only; targeted delivery is unsupported") },
+  runner = Direct,
   target = OptionalKeyboard,
   group = "input",
   description = "Press one key or shortcut written as one string, such as \"enter\" or \"ctrl+l\".",
@@ -639,7 +673,7 @@ pub async fn press_key_in_active_app(key: String) -> Result<auv_driver::InputAct
 
 #[derive(Clone, Debug, Args, serde::Serialize, serde::Deserialize)]
 #[command(
-  after_long_help = "Examples:\n  auv invoke input.clickPoint 1032.5 1212\n  auv invoke input.clickPoint 0.5 0.5 --target app:com.apple.TextEdit --relative-to window --normalized\n  auv invoke input.clickPoint 100 80 --target display:1 --relative-to display"
+  after_long_help = "Examples:\n  auv invoke input.clickPoint 1032.5 1212\n  auv invoke input.clickPoint 0.5 0.5 --target app:com.apple.TextEdit --relative-to window --normalized\n  auv invoke input.clickPoint 640 360 --target app:com.apple.TextEdit --relative-to screen\n  auv invoke input.clickPoint 100 80 --target display:1 --relative-to display"
 )]
 struct ClickPointArgs {
   /// Mouse button: left, right, or middle. Defaults to left.
@@ -650,7 +684,7 @@ struct ClickPointArgs {
   x: f64,
   /// Y coordinate in the selected coordinate basis.
   y: f64,
-  /// Coordinate basis. Defaults from --target: screen, window, or display.
+  /// Coordinate basis. Defaults from --target: screen, window, or display. Use screen with an app or window target for a screen point, such as a display.capture pixel divided by its scale factor plus its capture origin.
   #[arg(long, value_enum)]
   #[serde(rename = "relative-to", default)]
   relative_to: Option<RelativeToArg>,
@@ -661,7 +695,7 @@ struct ClickPointArgs {
   /// Window title text used with an app target.
   #[arg(long, value_name = "TEXT")]
   title: Option<String>,
-  /// Window input delivery policy. Valid only with --relative-to window.
+  /// Window input delivery policy. Valid only with an app or window target.
   #[arg(long, value_enum)]
   #[serde(rename = "input-policy")]
   input_policy: Option<InputPolicyArg>,
@@ -764,6 +798,36 @@ impl ClickPointArgs {
   }
 }
 
+/// Whether `target` names an application or window. With such a target,
+/// `--relative-to screen` points (for example read from `display.capture`) go
+/// to that window: it is resolved and activated like a window-relative point.
+pub(crate) fn targets_window(target: Option<&crate::ExecutionTarget>) -> bool {
+  matches!(target, Some(crate::ExecutionTarget::Application { .. } | crate::ExecutionTarget::Window { .. }))
+}
+
+/// Maps a screen point given with an app or window target into that window,
+/// rejecting points outside its frame.
+///
+/// NOTICE: the check trusts the reported frame. On GNOME Wayland, AT-SPI can
+/// report a top-level window at `0,0` when the shell-stage origin repair finds
+/// no match (`needs_shell_stage_origin` in `auv-driver-linux`), so a correct
+/// screen point is rejected as outside the window. That fails closed; the
+/// window basis in the same case clicks at the wrong place instead.
+pub(crate) fn screen_point_in_window(
+  command_id: &str,
+  point: auv_driver::Point,
+  frame: auv_driver::Rect,
+) -> Result<auv_driver::Point, String> {
+  let local = auv_driver::Point::new(point.x - frame.origin.x, point.y - frame.origin.y);
+  if !(0.0..=frame.size.width).contains(&local.x) || !(0.0..=frame.size.height).contains(&local.y) {
+    return Err(format!(
+      "{command_id} screen point {},{} is outside the target window, whose frame is {},{} {}x{}",
+      point.x, point.y, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height
+    ));
+  }
+  Ok(local)
+}
+
 /// Resolves and validates the coordinate basis shared by point-based input commands.
 pub(crate) fn point_basis(
   command_id: &str,
@@ -786,7 +850,10 @@ pub(crate) fn point_basis(
   };
   match (target, basis) {
     (None, RelativeToArg::Screen)
-    | (Some(crate::ExecutionTarget::Application { .. } | crate::ExecutionTarget::Window { .. }), RelativeToArg::Window)
+    | (
+      Some(crate::ExecutionTarget::Application { .. } | crate::ExecutionTarget::Window { .. }),
+      RelativeToArg::Window | RelativeToArg::Screen,
+    )
     | (Some(crate::ExecutionTarget::Display { .. }), RelativeToArg::Display) => {}
     (None, RelativeToArg::Window) => return Err(format!("{command_id} --relative-to window requires --target app: or window:")),
     (None, RelativeToArg::Display) => return Err(format!("{command_id} --relative-to display requires --target display:")),
@@ -795,8 +862,8 @@ pub(crate) fn point_basis(
   if normalized && basis == RelativeToArg::Screen {
     return Err(format!("{command_id} --normalized is valid only relative to a window or display"));
   }
-  if has_input_policy && basis != RelativeToArg::Window {
-    return Err(format!("{command_id} --input-policy is valid only with --relative-to window"));
+  if has_input_policy && basis != RelativeToArg::Window && !(basis == RelativeToArg::Screen && targets_window(target)) {
+    return Err(format!("{command_id} --input-policy is valid only with an app: or window: target"));
   }
   if has_title && !matches!(target, Some(crate::ExecutionTarget::Application { .. })) {
     return Err(format!("{command_id} --title requires --target app:"));
@@ -820,6 +887,7 @@ pub struct ClickPointResult {
 #[invoke_command(
   id = "input.clickPoint",
   support = { macos: Supported, linux: Partial("foreground delivery only; background_only input policy is rejected"), windows: Partial("background delivery posts window messages, so whether an application acts on them depends on its toolkit") },
+  runner = Direct,
   target = OptionalPoint,
   group = "input",
   description = "Click a point relative to the screen, a target window, or a target display.",
@@ -831,7 +899,7 @@ async fn click_point(input: InvokeCommandInput, args: ClickPointArgs) -> InvokeC
   #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
   {
     match basis {
-      RelativeToArg::Screen => {
+      RelativeToArg::Screen if !targets_window(input.target.as_ref()) => {
         let screen_point = ScreenPoint::new(args.x, args.y);
         let action = if input.dry_run {
           None
@@ -853,7 +921,7 @@ async fn click_point(input: InvokeCommandInput, args: ClickPointArgs) -> InvokeC
           action,
         })
       }
-      RelativeToArg::Window => {
+      RelativeToArg::Window | RelativeToArg::Screen => {
         let session = auv::local::open().map_err(|error| error.to_string())?;
         let target = input.target.as_ref().expect("window-relative target validated");
         let window = match target {
@@ -865,7 +933,11 @@ async fn click_point(input: InvokeCommandInput, args: ClickPointArgs) -> InvokeC
           }
           crate::ExecutionTarget::Display { .. } => unreachable!("target/basis validated"),
         };
-        let point = resolve_local_point("input.clickPoint", args.x, args.y, args.normalized, window.frame.size, "window")?;
+        let point = if basis == RelativeToArg::Screen {
+          screen_point_in_window("input.clickPoint", auv_driver::Point::new(args.x, args.y), window.frame)?
+        } else {
+          resolve_local_point("input.clickPoint", args.x, args.y, args.normalized, window.frame.size, "window")?
+        };
         let window_point = auv_driver::WindowPoint::new(point.x, point.y);
         let screen_point = ScreenPoint::new(window.frame.origin.x + point.x, window.frame.origin.y + point.y);
         let action = if input.dry_run {
@@ -987,7 +1059,7 @@ struct DragArgs {
   #[arg(long, default_value = "left", value_parser = ["left", "right", "middle"])]
   #[serde(default = "default_click_button")]
   button: String,
-  /// Coordinate basis. Defaults from --target: screen, window, or display.
+  /// Coordinate basis. Defaults from --target: screen, window, or display. Use screen with an app or window target for a screen point, such as a display.capture pixel divided by its scale factor plus its capture origin.
   #[arg(long, value_enum)]
   #[serde(rename = "relative-to", default)]
   relative_to: Option<RelativeToArg>,
@@ -998,7 +1070,7 @@ struct DragArgs {
   /// Window title text used with an app target.
   #[arg(long, value_name = "TEXT")]
   title: Option<String>,
-  /// Window input delivery policy. Valid only with --relative-to window.
+  /// Window input delivery policy. Valid only with an app or window target.
   #[arg(long, value_enum)]
   #[serde(rename = "input-policy")]
   input_policy: Option<InputPolicyArg>,
@@ -1079,6 +1151,19 @@ impl DragPlan {
     ))
   }
 
+  /// Screen endpoints inside a target window: screen-basis points as given,
+  /// window-basis points mapped through the frame.
+  pub(crate) fn window_screen_points(&self, frame: auv_driver::Rect) -> Result<(ScreenPoint, ScreenPoint), crate::InvokeFailure> {
+    if self.basis != RelativeToArg::Screen {
+      return self.screen_points(frame, "window");
+    }
+    for point in [self.start, self.end] {
+      screen_point_in_window("input.drag", point, frame)
+        .map_err(|message| crate::InvokeFailure::new(crate::FailureCode::InvalidInput, message))?;
+    }
+    Ok((ScreenPoint::new(self.start.x, self.start.y), ScreenPoint::new(self.end.x, self.end.y)))
+  }
+
   /// Builds one straight drag path in screen coordinates. Window-targeted
   /// delivery also takes screen points; the driver stamps window-local positions.
   pub(crate) fn movement(&self, target: auv_driver::InputTarget, start: ScreenPoint, end: ScreenPoint) -> auv_driver::MoveMouseRequest {
@@ -1144,6 +1229,13 @@ impl DragResult {
 #[invoke_command(
   id = "input.drag",
   support = { macos: Supported, linux: Partial("foreground delivery only; background_only input policy is rejected"), windows: Partial("background delivery posts window messages, so whether an application acts on them depends on its toolkit") },
+  // DragMouse carries no window policy, so the Runner route refuses the foreground-preferred
+  // input policy before any RPC; every platform is Partial because of that refusal.
+  runner = {
+    macos: Partial("foreground-preferred input policy is refused; DragMouse carries no window policy"),
+    linux: Partial("foreground-preferred input policy is refused; foreground delivery only; background_only input policy is rejected"),
+    windows: Partial("foreground-preferred input policy is refused; background delivery posts window messages, so whether an application acts on them depends on its toolkit"),
+  },
   target = OptionalPoint,
   group = "input",
   description = "Press a mouse button, move in a straight line, and release it at the end point.",
@@ -1156,23 +1248,26 @@ async fn drag(input: InvokeCommandInput, args: DragArgs) -> crate::InvokeExecuti
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 async fn execute_drag(input: &InvokeCommandInput, plan: DragPlan) -> crate::InvokeExecutionResult {
-  // Screen-relative validation needs no target lookup, so its dry run stays hermetic.
+  // Screen-relative validation without a target needs no lookup, so its dry
+  // run stays hermetic. With an app or window target, even a dry run resolves
+  // the window, because the bounds check needs its frame.
+  let window_target = targets_window(input.target.as_ref());
   let session = match (plan.basis, input.dry_run) {
-    (RelativeToArg::Screen, true) => None,
+    (RelativeToArg::Screen, true) if !window_target => None,
     _ => Some(auv::local::open()?),
   };
   let mut result = match plan.basis {
-    RelativeToArg::Screen => {
+    RelativeToArg::Screen if !window_target => {
       DragResult::planned(&plan, ScreenPoint::new(plan.start.x, plan.start.y), ScreenPoint::new(plan.end.x, plan.end.y))
     }
-    RelativeToArg::Window => {
+    RelativeToArg::Window | RelativeToArg::Screen => {
       let session = session.as_ref().expect("window resolution opens a session");
       let window = match input.target.as_ref().expect("window-relative target validated") {
         crate::ExecutionTarget::Application { id } => session.window().resolve(click_window_selector(id, plan.title.as_deref()))?,
         crate::ExecutionTarget::Window { id } => auv_driver::find_window(session.window().list()?, id)?,
         crate::ExecutionTarget::Display { .. } => unreachable!("target/basis validated"),
       };
-      let (start, end) = plan.screen_points(window.frame, "window")?;
+      let (start, end) = plan.window_screen_points(window.frame)?;
       let mut result = DragResult::planned(&plan, start, end);
       result.window = Some(window);
       result
@@ -1490,6 +1585,7 @@ pub struct ScrollResult {
 #[invoke_command(
   id = "input.scroll",
   support = { macos: Supported, linux: Partial("foreground delivery only; background_only input policy is rejected"), windows: Partial("background delivery posts window messages, so whether an application acts on them depends on its toolkit") },
+  runner = Direct,
   target = RequiredWindow,
   group = "input",
   description = "Scroll at a point in a target window by logical-pixel deltas (positive dy scrolls down). Requires an app or window target; without one, use input.scrollPoint.",
@@ -1761,6 +1857,7 @@ pub struct ScrollUntilOutput {
 #[invoke_command(
   id = "input.scrollUntil",
   support = { macos: Supported, linux: Partial("foreground delivery only; background_only input policy is rejected"), windows: Partial("background delivery posts window messages, so whether an application acts on them depends on its toolkit") },
+  runner = Direct,
   target = RequiredWindow,
   group = "input",
   description = "Scroll a target window in steps until no visual motion remains, target text appears, or a step budget runs out.",
@@ -1920,7 +2017,7 @@ fn click_window_selector(application_id: &str, title: Option<&str>) -> auv_drive
   #[cfg(target_os = "windows")]
   let app = Some(App::name(application_id));
   #[cfg(not(target_os = "windows"))]
-  let app = Some(App::bundle_id(application_id));
+  let app = Some(App::id(application_id));
 
   WindowSelector {
     app,
@@ -2083,9 +2180,7 @@ fn local_keyboard_target(
 ) -> Result<auv_driver::InputTarget, crate::InvokeFailure> {
   let target = match input.target.as_ref() {
     None => auv_driver::InputTarget::Foreground,
-    Some(crate::ExecutionTarget::Application { id }) => auv_driver::InputTarget::Application {
-      bundle_id: id.clone(),
-    },
+    Some(crate::ExecutionTarget::Application { id }) => auv_driver::InputTarget::Application { id: id.clone() },
     Some(crate::ExecutionTarget::Window { id }) => {
       auv_driver::InputTarget::Window(session.window().list()?.into_iter().find(|window| window.reference.id == *id).ok_or_else(|| {
         auv_driver::DriverError::NotFound {

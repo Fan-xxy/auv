@@ -3,10 +3,10 @@
 use auv::protocol::position::encode as position_to_proto;
 use auv_api_proto::auv::api::driver::macos::v1 as macos_proto;
 use auv_api_proto::auv::api::driver::macos::v1::accessibility_service_server::{AccessibilityService, AccessibilityServiceServer};
-use auv_api_proto::auv::api::driver::macos::v1::application_service_server::{ApplicationService, ApplicationServiceServer};
 use auv_api_proto::auv::api::driver::macos::v1::media_control_service_server::{MediaControlService, MediaControlServiceServer};
 use auv_api_proto::auv::api::driver::macos::v1::permission_service_server::{PermissionService, PermissionServiceServer};
 use auv_api_proto::auv::api::driver::v1 as proto;
+use auv_api_proto::auv::api::driver::v1::application_service_server::{ApplicationService, ApplicationServiceServer};
 use auv_api_proto::auv::api::driver::v1::capture_service_server::{CaptureService, CaptureServiceServer};
 use auv_api_proto::auv::api::driver::v1::display_service_server::{DisplayService, DisplayServiceServer};
 use auv_api_proto::auv::api::driver::v1::input_service_server::{InputService, InputServiceServer};
@@ -340,55 +340,26 @@ fn ax_focus_result_to_proto(result: auv_driver::AxFocusResult) -> Result<macos_p
 
 #[tonic::async_trait]
 impl ApplicationService for LocalApplicationService {
-  async fn activate_bundle_id(
+  async fn activate_application(
     &self,
-    request: Request<macos_proto::ActivateBundleIdRequest>,
-  ) -> Result<Response<macos_proto::ActivateBundleIdResponse>, Status> {
+    request: Request<proto::ActivateApplicationRequest>,
+  ) -> Result<Response<proto::ActivateApplicationResponse>, Status> {
     let request = request.into_inner();
-    let bundle_id = application_bundle_id(&request.bundle_id)?;
+    let application_id = requested_application_id(&request.application_id)?;
     let settle = duration_from_proto(request.settle, std::time::Duration::from_millis(150), "settle")?;
-    #[cfg(target_os = "macos")]
-    {
-      use auv_driver_macos::ApplicationControl as _;
-
-      let result = self.session.activate_bundle_id(bundle_id, settle).map_err(driver_status)?;
-      Ok(Response::new(application_activation_to_proto(result)))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-      let _ = (&self.session, settle);
-      Err(Status::unimplemented("macOS ApplicationService is unavailable on this local Driver platform"))
-    }
+    // Platforms without activation (Linux today) return a typed Unsupported
+    // error, which `driver_status` maps to UNIMPLEMENTED.
+    let result = self.session.applications().activate(application_id, settle).map_err(driver_status)?;
+    Ok(Response::new(auv::protocol::application::encode(result)))
   }
 }
 
-fn application_bundle_id(bundle_id: &str) -> Result<&str, Status> {
-  let bundle_id = bundle_id.trim();
-  if bundle_id.is_empty() {
-    return Err(Status::invalid_argument("bundle_id is required"));
+fn requested_application_id(application_id: &str) -> Result<&str, Status> {
+  let application_id = application_id.trim();
+  if application_id.is_empty() {
+    return Err(Status::invalid_argument("application_id is required"));
   }
-  Ok(bundle_id)
-}
-
-fn application_activation_to_proto(result: auv_driver::ApplicationActivationResult) -> macos_proto::ActivateBundleIdResponse {
-  use auv_driver::ApplicationActivationVerification as Domain;
-  use macos_proto::application_activation_verification::Verification;
-
-  let verification = match result.verification {
-    Domain::VerifiedForeground { observed_bundle_id } => {
-      Verification::VerifiedForeground(macos_proto::VerifiedForeground { observed_bundle_id })
-    }
-    Domain::ForegroundMismatch { observed_bundle_id } => {
-      Verification::ForegroundMismatch(macos_proto::ForegroundMismatch { observed_bundle_id })
-    }
-    Domain::Unavailable { reason } => Verification::Unavailable(macos_proto::VerificationUnavailable { reason }),
-  };
-  macos_proto::ActivateBundleIdResponse {
-    requested_bundle_id: result.requested_bundle_id,
-    verification: Some(macos_proto::ApplicationActivationVerification {
-      verification: Some(verification),
-    }),
-  }
+  Ok(application_id)
 }
 
 #[derive(Default)]
@@ -1068,7 +1039,7 @@ fn input_target_from_proto(
   match target.and_then(|target| target.recipient).ok_or_else(|| Status::invalid_argument("target is required"))? {
     Recipient::Foreground(true) => Ok(auv_driver::InputTarget::Foreground),
     Recipient::Foreground(false) => Err(Status::invalid_argument("foreground target must be true")),
-    Recipient::ApplicationBundleId(bundle_id) => Ok(auv_driver::InputTarget::Application { bundle_id }),
+    Recipient::ApplicationId(id) => Ok(auv_driver::InputTarget::Application { id }),
     Recipient::Window(observed) => {
       let reference = observed.r#ref.ok_or_else(|| Status::invalid_argument("window.ref is required"))?;
       let expected = observed.process_id.filter(|pid| *pid > 0).ok_or_else(|| Status::invalid_argument("window.process_id is required"))?;
@@ -1570,6 +1541,7 @@ fn scroll_until_update_to_proto(
 fn scroll_until_stop_reason_to_proto(reason: auv_scan::ScrollUntilStopReason) -> proto::ScrollUntilStopReason {
   match reason {
     auv_scan::ScrollUntilStopReason::EndByNoVisualProgress => proto::ScrollUntilStopReason::EndByNoVisualProgress,
+    auv_scan::ScrollUntilStopReason::NoVisualProgressFromStart => proto::ScrollUntilStopReason::NoVisualProgressFromStart,
     auv_scan::ScrollUntilStopReason::TextVisible => proto::ScrollUntilStopReason::TextVisible,
     auv_scan::ScrollUntilStopReason::BudgetExhausted => proto::ScrollUntilStopReason::BudgetExhausted,
     auv_scan::ScrollUntilStopReason::PredicateSatisfied => proto::ScrollUntilStopReason::PredicateSatisfied,
@@ -2449,9 +2421,11 @@ impl CaptureService for LocalCaptureService {
       ..Default::default()
     };
     let capture = self.session.window().capture_with(&window, options).map_err(driver_status)?;
+    let capture = stored_capture_to_proto(&self.captures, capture);
+    record_stored_capture(&self.captures, &capture, "auv.driver.window_capture");
     Ok(Response::new(proto::CaptureWindowResponse {
       window: Some(window_to_proto(window)),
-      capture: Some(stored_capture_to_proto(&self.captures, capture)),
+      capture: Some(capture),
     }))
   }
 
@@ -2470,9 +2444,11 @@ impl CaptureService for LocalCaptureService {
         ..Default::default()
       })
       .map_err(driver_status)?;
+    let capture = stored_capture_to_proto(&self.captures, captured.capture);
+    record_stored_capture(&self.captures, &capture, "auv.driver.display_capture");
     Ok(Response::new(proto::CaptureDisplayResponse {
       display: Some(display_to_proto(captured.display)),
-      capture: Some(stored_capture_to_proto(&self.captures, captured.capture)),
+      capture: Some(capture),
     }))
   }
 
@@ -2490,9 +2466,11 @@ impl CaptureService for LocalCaptureService {
         ..Default::default()
       })
       .map_err(driver_status)?;
+    let capture = stored_capture_to_proto(&self.captures, captured.capture);
+    record_stored_capture(&self.captures, &capture, "auv.driver.screen_region_capture");
     Ok(Response::new(proto::CaptureRegionResponse {
       display: Some(display_to_proto(captured.display)),
-      capture: Some(stored_capture_to_proto(&self.captures, captured.capture)),
+      capture: Some(capture),
     }))
   }
 }
@@ -2532,8 +2510,8 @@ impl WindowService for LocalWindowService {
 
 fn selector_from_proto(selector: proto::WindowSelector) -> Result<auv_driver::WindowSelector, Status> {
   let app = match selector.application {
-    Some(proto::window_selector::Application::ApplicationBundleId(value)) if !value.trim().is_empty() => auv_driver::AppSelector {
-      bundle: Some(auv_driver::TextMatcher::Exact(value)),
+    Some(proto::window_selector::Application::ApplicationId(value)) if !value.trim().is_empty() => auv_driver::AppSelector {
+      id: Some(auv_driver::TextMatcher::Exact(value)),
       ..Default::default()
     },
     Some(proto::window_selector::Application::ApplicationName(value)) if !value.trim().is_empty() => auv_driver::AppSelector {
@@ -2574,7 +2552,7 @@ fn window_to_proto(window: auv_driver::Window) -> proto::Window {
     }),
     title: window.title,
     application_name: window.app_name,
-    application_bundle_id: window.app_bundle_id,
+    application_id: window.application_id,
     process_id: window.process_id,
     frame: Some(proto::ScreenRect {
       x: window.frame.origin.x,
@@ -2626,6 +2604,17 @@ pub(super) fn image_frame_to_proto(capture: auv_driver::Capture) -> proto::Image
 
 /// Stores a capture and returns its reference and metadata, without pixels
 /// (see "Image Payloads" in AGENTS.md).
+/// Records a capture this Runner just stored as evidence of the current call.
+// TODO(runner-capture-evidence-coverage): captures taken inside text search,
+// scroll-until, and recent-frame streams are not recorded yet; their RPCs
+// still record the returned references. Add them when a reader needs those
+// frames, with a rate bound for streams.
+fn record_stored_capture(captures: &CaptureStore, frame: &proto::CapturedFrame, purpose: &'static str) {
+  if let Some(reference) = &frame.r#ref {
+    super::recording::record_capture(captures, &reference.capture_id, purpose);
+  }
+}
+
 fn stored_capture_to_proto(captures: &CaptureStore, capture: auv_driver::Capture) -> proto::CapturedFrame {
   let mut frame = capture_metadata_to_proto(&capture);
   frame.thumbhash = capture_thumbhash(&capture.image);
@@ -2698,6 +2687,8 @@ impl DisplayService for LocalDisplayService {
 #[cfg(any(unix, windows))]
 pub(super) async fn serve_inherited() -> Result<(), String> {
   let (incoming, shutdown) = auv_api_server::runner_transport::inherited_transport()?.into_parts();
+  super::recording::install()?;
+  let rpc_layer = super::recording::RpcLayer::new()?;
 
   let portal_state_root = std::env::var_os(super::STATE_ROOT_ENV).map(|root| std::path::PathBuf::from(root).join("portal"));
   let driver = auv::local::driver(portal_state_root).map_err(|error| error.to_string())?;
@@ -2759,10 +2750,11 @@ pub(super) async fn serve_inherited() -> Result<(), String> {
   health_reporter.set_serving::<RecentFramesServiceServer<super::recent_frames::Service>>().await;
   health_reporter.set_serving::<TextRecognitionServiceServer<LocalTextRecognitionService>>().await;
   health_reporter.set_serving::<InputServiceServer<LocalInputService>>().await;
+  // Served on every platform: Linux answers with a typed UNIMPLEMENTED until
+  // its activation backends land, instead of an absent service.
+  health_reporter.set_serving::<ApplicationServiceServer<LocalApplicationService>>().await;
   #[cfg(target_os = "macos")]
   health_reporter.set_serving::<PermissionServiceServer<LocalPermissionService>>().await;
-  #[cfg(target_os = "macos")]
-  health_reporter.set_serving::<ApplicationServiceServer<LocalApplicationService>>().await;
   #[cfg(target_os = "macos")]
   health_reporter.set_serving::<AccessibilityServiceServer<LocalAccessibilityService>>().await;
   #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2776,11 +2768,10 @@ pub(super) async fn serve_inherited() -> Result<(), String> {
     "auv.api.driver.v1.RecentFramesService",
     "auv.api.driver.v1.TextRecognitionService",
     "auv.api.driver.v1.InputService",
+    "auv.api.driver.v1.ApplicationService",
   ];
   #[cfg(target_os = "macos")]
   served_services.push("auv.api.driver.macos.v1.PermissionService");
-  #[cfg(target_os = "macos")]
-  served_services.push("auv.api.driver.macos.v1.ApplicationService");
   #[cfg(target_os = "macos")]
   served_services.push("auv.api.driver.macos.v1.AccessibilityService");
   #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -2800,6 +2791,7 @@ pub(super) async fn serve_inherited() -> Result<(), String> {
     auv_api_server::reflection::service(&descriptor_set).map_err(|error| format!("failed to build local Runner reflection: {error}"))?;
 
   let serve_result = tonic::transport::Server::builder()
+    .layer(rpc_layer)
     .add_service(health)
     .add_service(reflection)
     .add_service(method_docs)
@@ -2818,6 +2810,7 @@ pub(super) async fn serve_inherited() -> Result<(), String> {
     .await
     .map_err(|error| format!("Runner transport failed: {error}"));
   let shutdown_result = recent_frames_service.shutdown().await.map_err(|error| format!("recent-frame shutdown failed: {error}"));
+  super::recording::finish().await;
   let input_shutdown = tokio::task::spawn_blocking(|| auv_driver::mouse_input::mouse_coordinator().shutdown())
     .await
     .map_err(|error| format!("input shutdown task failed: {error}"))

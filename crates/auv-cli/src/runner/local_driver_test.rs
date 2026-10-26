@@ -112,35 +112,18 @@ fn permission_probe_mapper_preserves_every_status() {
 }
 
 #[test]
-fn application_activation_mapper_preserves_each_verification_variant() {
-  use auv_api_proto::auv::api::driver::macos::v1::application_activation_verification::Verification;
-
-  let cases = [
-    auv_driver::ApplicationActivationVerification::VerifiedForeground {
-      observed_bundle_id: "com.example.Verified".to_string(),
-    },
-    auv_driver::ApplicationActivationVerification::ForegroundMismatch {
-      observed_bundle_id: "com.example.Other".to_string(),
-    },
-    auv_driver::ApplicationActivationVerification::Unavailable {
-      reason: "update unavailable".to_string(),
-    },
-  ];
-  for verification in cases {
-    let mapped = application_activation_to_proto(auv_driver::ApplicationActivationResult {
-      requested_bundle_id: "com.example.Requested".to_string(),
-      verification,
-    });
-    assert_eq!(mapped.requested_bundle_id, "com.example.Requested");
-    assert!(matches!(
-      mapped.verification.and_then(|verification| verification.verification),
-      Some(Verification::VerifiedForeground(_) | Verification::ForegroundMismatch(_) | Verification::Unavailable(_))
-    ));
+fn linux_application_activation_is_unimplemented_not_activation_only() {
+  // The Linux facade returns these errors for Wayland sessions; the
+  // Runner must surface them as UNIMPLEMENTED, never as a response.
+  for kind in [auv_driver::ApplicationIdKind::DesktopAppId] {
+    let status = driver_status(auv_driver::application::unsupported_activation(kind));
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(status.message().contains("Linux"), "{}", status.message());
   }
 }
 
 #[test]
-fn application_request_validation_rejects_blank_bundle_and_invalid_duration() {
+fn application_request_validation_rejects_blank_application_id_and_invalid_duration() {
   assert_eq!(
     duration_from_proto(
       Some(prost_types::Duration {
@@ -154,7 +137,7 @@ fn application_request_validation_rejects_blank_bundle_and_invalid_duration() {
     .code(),
     tonic::Code::InvalidArgument
   );
-  assert_eq!(application_bundle_id("  ").expect_err("blank bundle id").code(), tonic::Code::InvalidArgument);
+  assert_eq!(requested_application_id("  ").expect_err("blank application id").code(), tonic::Code::InvalidArgument);
 }
 
 #[test]
@@ -320,9 +303,10 @@ async fn live_windows_runner_media_control_parity() {
     .expect("connect to local runner media service");
   let mut client = MediaControlServiceClient::new(channel);
 
-  let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-  let repo_root = manifest_dir.ancestors().nth(2).unwrap_or(&manifest_dir);
-  let jsonl_path = repo_root.join("docs/ai/references/driver/2026-10-13-windows-runner-mediacontrol.jsonl");
+  // NOTICE: records go to the temp dir so a rerun cannot overwrite the committed
+  // evidence in docs/ai/references/driver/; copy the file there after review.
+  let jsonl_path = std::env::temp_dir().join("auv-windows-runner-mediacontrol.jsonl");
+  println!("Writing records to {}", jsonl_path.display());
   let mut jsonl_file =
     std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&jsonl_path).expect("open jsonl output file");
 
@@ -903,7 +887,7 @@ fn window_scoped_positions_convert_with_the_current_window_frame() {
     },
     title: None,
     app_name: None,
-    app_bundle_id: None,
+    application_id: None,
     process_id: None,
     frame: auv_driver::Rect::new(100.0, 50.0, 400.0, 300.0),
     coordinate_space: auv_driver::CoordinateSpace::Screen,
@@ -1697,6 +1681,19 @@ fn scroll_until_update_carries_capture_ref_text_and_stop_reason() {
   let proto = scroll_until_update_to_proto(update(1, None, None), true, &captures);
   assert_eq!(proto.stop, proto::ScrollUntilStopReason::Unspecified as i32);
   assert!(proto.awaiting_decision && proto.text.is_none());
+}
+
+// A viewport that never moved must reach clients as its own reason, not as the end of content.
+#[test]
+fn scroll_until_keeps_never_moved_apart_from_the_end_on_the_wire() {
+  assert_eq!(
+    scroll_until_stop_reason_to_proto(auv_scan::ScrollUntilStopReason::NoVisualProgressFromStart),
+    proto::ScrollUntilStopReason::NoVisualProgressFromStart
+  );
+  assert_eq!(
+    scroll_until_stop_reason_to_proto(auv_scan::ScrollUntilStopReason::EndByNoVisualProgress),
+    proto::ScrollUntilStopReason::EndByNoVisualProgress
+  );
 }
 
 fn gradient_capture(width: u32, height: u32) -> auv_driver::Capture {

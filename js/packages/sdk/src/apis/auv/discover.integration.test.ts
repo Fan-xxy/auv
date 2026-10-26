@@ -1,14 +1,13 @@
 import { isMacOS } from 'std-env'
 import { describe, expect, it } from 'vitest'
 
-import { connect } from '../../node/index'
 import { neteaseMusicRunner, setupAuvDaemon } from '../../tutils/auv-daemon'
 import { createAuv } from './client'
 
 describe('runner discovery through a real AUV daemon', () => {
   it.skipIf(!isMacOS)('invokes discovered unary and server-streaming methods through spawned Runners', async () => {
     const daemon = await setupAuvDaemon({ runners: [neteaseMusicRunner] })
-    const connection = await connect({ endpoint: daemon.ownerSocket, local: true, transport: 'unix' })
+    const connection = await daemon.connectOwner()
 
     try {
       const runner = await createAuv(connection).runners.discover({
@@ -69,7 +68,7 @@ describe('runner discovery through a real AUV daemon', () => {
           'auv.netease_music.v1.PlayRequest': {
             additionalProperties: false,
             properties: {
-              applicationBundleId: { type: 'string' },
+              applicationId: { type: 'string' },
             },
             type: 'object',
           },
@@ -123,7 +122,7 @@ describe('runner discovery through a real AUV daemon', () => {
         },
       })
       await expect(runner.invokeUnaryJson({
-        input: { applicationBundleId: 'dev.auv.nonexistent-test-player' },
+        input: { applicationId: 'dev.auv.nonexistent-test-player' },
         method: nowPlaying!,
       })).resolves.toEqual({})
 

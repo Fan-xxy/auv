@@ -98,6 +98,7 @@ struct InputFixture {
   downs: std::sync::Mutex<Vec<proto::KeyDownRequest>>,
   ups: std::sync::Mutex<Vec<auv_driver::KeyboardHoldId>>,
   scrolls: std::sync::Mutex<Vec<proto::ScrollPointRequest>>,
+  statuses: std::sync::Mutex<std::collections::VecDeque<tonic::Status>>,
 }
 
 fn fixture_action(path: proto::InputDeliveryPath) -> proto::InputActionResult {
@@ -130,6 +131,11 @@ macro_rules! input_fixture_impl {
       }
 
       async fn key_up(&self, request: tonic::Request<proto::KeyUpRequest>) -> Result<tonic::Response<proto::KeyUpResponse>, tonic::Status> {
+        // Tests inject raw Runner statuses here to pin how a tonic status a
+        // Runner actually returns survives the transport as a category.
+        if let Some(status) = self.statuses.lock().expect("status queue lock").pop_front() {
+          return Err(status);
+        }
         let hold_id = request.into_inner().hold_id;
         let mut ups = self.ups.lock().expect("up requests lock");
         let path = match hold_id {
@@ -274,6 +280,33 @@ async fn typed_key_holds_preserve_target_policy_timeout_id_and_release_results()
   server.abort();
 }
 
+// Pins the transport half of the runner failure roundtrip: a tonic status a
+// Runner actually returns survives the wire into the protocol-neutral
+// category the invoke layer serializes, and the failing step plus the
+// Runner's own status text stay in the message.
+#[tokio::test]
+async fn loopback_statuses_keep_their_transport_category_and_step_context() {
+  let service = std::sync::Arc::new(InputFixture::default());
+  let (input, server) = serve_input_fixture(service.clone()).await;
+  let cases = [
+    (tonic::Status::unimplemented("capability absent"), crate::error::ClientErrorKind::Unsupported),
+    (tonic::Status::not_found("window closed"), crate::error::ClientErrorKind::NotFound),
+    (tonic::Status::permission_denied("not allowed"), crate::error::ClientErrorKind::Unauthorized),
+    (tonic::Status::invalid_argument("bad coordinates"), crate::error::ClientErrorKind::InvalidRequest),
+    (tonic::Status::unavailable("daemon restarting"), crate::error::ClientErrorKind::Unavailable),
+    (tonic::Status::internal("runner panicked"), crate::error::ClientErrorKind::Protocol),
+  ];
+  for (status, kind) in cases {
+    service.statuses.lock().expect("status queue lock").push_back(status.clone());
+    let error = input.key_up(42).await.expect_err("injected status reaches the caller");
+    assert_eq!(error.client_kind(), Some(kind), "status {status}");
+    let message = error.to_string();
+    assert!(message.contains("Runner capability RPC failed:"), "step context missing: {message}");
+    assert!(message.contains(status.message()), "runner status text missing: {message}");
+  }
+  server.abort();
+}
+
 #[tokio::test]
 async fn typed_key_hold_rejects_invalid_timeout_and_id_without_transport() {
   let input = RunnerClient::new(disconnected_client(), route()).expect("runner client").input();
@@ -367,7 +400,7 @@ async fn resolved_window_child_retains_the_exact_resource_reference() {
       },
       title: None,
       app_name: None,
-      app_bundle_id: None,
+      application_id: None,
       process_id: None,
       frame: auv_driver::Rect::new(0.0, 0.0, 100.0, 100.0),
       coordinate_space: auv_driver::CoordinateSpace::Screen,
@@ -622,47 +655,48 @@ fn accessibility_mapper_rejects_missing_result_before_rendering() {
   assert!(matches!(error, CapabilityError::InvalidResponse(_)));
 }
 
+fn activation_response(requested_application_id: &str) -> proto::ActivateApplicationResponse {
+  crate::protocol::application::encode(auv_driver::ApplicationActivationResult {
+    requested_application_id: requested_application_id.to_string(),
+    application_id_kind: auv_driver::ApplicationIdKind::BundleId,
+    method: auv_driver::ApplicationActivationMethod::AppleScriptActivate,
+    activated_window: None,
+    verification: auv_driver::ApplicationActivationVerification::ForegroundMismatch {
+      observed_application_id: "com.example.Other".to_string(),
+    },
+    window_observation: None,
+  })
+}
+
 #[test]
 fn application_activation_mapper_preserves_typed_verification() {
-  use macos_proto::application_activation_verification::Verification;
-
-  let result = activation_result_from_proto(macos_proto::ActivateBundleIdResponse {
-    requested_bundle_id: "com.example.Requested".to_string(),
-    verification: Some(macos_proto::ApplicationActivationVerification {
-      verification: Some(Verification::ForegroundMismatch(macos_proto::ForegroundMismatch {
-        observed_bundle_id: "com.example.Other".to_string(),
-      })),
-    }),
-  })
-  .expect("typed activation result");
-  assert_eq!(result.requested_bundle_id, "com.example.Requested");
+  let result =
+    activation_result_from_proto(" com.example.Requested ", activation_response("com.example.Requested")).expect("typed activation result");
+  assert_eq!(result.requested_application_id, "com.example.Requested");
+  assert_eq!(result.application_id_kind, auv_driver::ApplicationIdKind::BundleId);
   assert_eq!(
     result.verification,
     auv_driver::ApplicationActivationVerification::ForegroundMismatch {
-      observed_bundle_id: "com.example.Other".to_string(),
+      observed_application_id: "com.example.Other".to_string(),
     }
   );
 }
 
 #[test]
-fn application_activation_mapper_rejects_missing_or_empty_evidence() {
-  let missing = activation_result_from_proto(macos_proto::ActivateBundleIdResponse {
-    requested_bundle_id: "com.example.Requested".to_string(),
-    verification: None,
-  })
+fn application_activation_mapper_rejects_missing_evidence_or_a_changed_request() {
+  let missing = activation_result_from_proto(
+    "com.example.Requested",
+    proto::ActivateApplicationResponse {
+      verification: None,
+      ..activation_response("com.example.Requested")
+    },
+  )
   .expect_err("missing verification must fail closed");
   assert!(matches!(missing, CapabilityError::InvalidResponse(_)));
 
-  let empty = activation_result_from_proto(macos_proto::ActivateBundleIdResponse {
-    requested_bundle_id: "com.example.Requested".to_string(),
-    verification: Some(macos_proto::ApplicationActivationVerification {
-      verification: Some(macos_proto::application_activation_verification::Verification::Unavailable(
-        macos_proto::VerificationUnavailable::default(),
-      )),
-    }),
-  })
-  .expect_err("empty reason must fail closed");
-  assert!(matches!(empty, CapabilityError::InvalidResponse(_)));
+  let changed = activation_result_from_proto("com.example.Requested", activation_response("com.example.Other"))
+    .expect_err("a response for another application must fail closed");
+  assert!(matches!(changed, CapabilityError::InvalidResponse(_)));
 }
 
 #[tokio::test]

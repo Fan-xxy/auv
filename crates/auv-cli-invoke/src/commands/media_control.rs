@@ -20,6 +20,7 @@ pub fn group() -> CommandGroup {
 #[invoke_command(
   id = "mediaControl.nowPlaying",
   support = { macos: Supported, linux: Unsupported, windows: Partial("no duration, elapsed time or playback rate") },
+  runner = Direct,
   group = "mediaControl",
   description = "Read structured now-playing media state from the desktop backend.",
   input = NowPlayingArgs,
@@ -42,6 +43,10 @@ pub fn now_playing_state_output(state: &NowPlayingState) -> InvokeCommandResult 
 pub async fn read_now_playing() -> Result<NowPlayingOutput, String> {
   #[cfg(target_os = "windows")]
   let state = auv_driver_windows::media::now_playing().map_err(|error| error.to_string())?;
+  // TODO(invoke-driver-failure-migration): on Linux, `MediaError::Unsupported` reaches the caller
+  // of this and `control_media` as `command_failed`, not `unsupported`. Both helpers also back the
+  // Runner's media service, so typing them belongs with the Runner route's refusals
+  // (`TODO(invoke-support-runner-route)`), not with the local-handler refusals.
   #[cfg(not(target_os = "windows"))]
   let state = auv_media_macos::now_playing().map_err(|error| error.to_string())?;
   Ok(build_now_playing_output(&state))
@@ -54,6 +59,7 @@ struct PlayArgs {}
 #[invoke_command(
   id = "mediaControl.play",
   support = { macos: Supported, linux: Unsupported, windows: Supported },
+  runner = Direct,
   group = "mediaControl",
   description = "Send a generic system media play command and read now-playing state for verification.",
   input = PlayArgs,
@@ -70,6 +76,7 @@ struct PauseArgs {}
 #[invoke_command(
   id = "mediaControl.pause",
   support = { macos: Supported, linux: Unsupported, windows: Supported },
+  runner = Direct,
   group = "mediaControl",
   description = "Send a generic system media pause command and read now-playing state for verification.",
   input = PauseArgs,
@@ -86,6 +93,7 @@ struct TogglePlayPauseArgs {}
 #[invoke_command(
   id = "mediaControl.togglePlayPause",
   support = { macos: Supported, linux: Unsupported, windows: Supported },
+  runner = Direct,
   group = "mediaControl",
   description = "Send a generic system media play/pause toggle command and compare now-playing state before and after.",
   input = TogglePlayPauseArgs,
@@ -102,6 +110,7 @@ struct NextArgs {}
 #[invoke_command(
   id = "mediaControl.next",
   support = { macos: Supported, linux: Unsupported, windows: Supported },
+  runner = Direct,
   group = "mediaControl",
   description = "Send a generic system media next-track command and compare now-playing identity before and after.",
   input = NextArgs,
@@ -118,6 +127,7 @@ struct PreviousArgs {}
 #[invoke_command(
   id = "mediaControl.previous",
   support = { macos: Supported, linux: Unsupported, windows: Supported },
+  runner = Direct,
   group = "mediaControl",
   description = "Send a generic system media previous-track command and compare now-playing identity before and after.",
   input = PreviousArgs,

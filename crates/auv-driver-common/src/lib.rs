@@ -22,7 +22,8 @@ pub mod window;
 
 pub use accessibility::{AxFocusResult, AxTextRead, AxTextSelector, FocusTextOptions};
 pub use application::{
-  ApplicationActivationResult, ApplicationActivationVerification, ProcessActivationResult, ProcessActivationVerification,
+  ActivationWindowObservation, ApplicationActivationMethod, ApplicationActivationResult, ApplicationActivationVerification,
+  ApplicationIdKind,
 };
 pub use capture::{Activation, Capture, CaptureOptions, CaptureResolution, DisplayCapture, ImageView, RegionCapture};
 pub use display::{Display, ObservedDisplays};
@@ -37,7 +38,7 @@ pub use input::{
   KeyboardInputProgress, MouseButton, PasteTextOptions, PrepareForInputOptions, PressKeysOptions, Scroll, ScrollDeliveryCandidate,
   ScrollDeliveryStrategy, ScrollOptions, TextSubmit, TypeTextOptions, WaitOptions, WindowClickStrategy, WindowInput,
 };
-pub use keyboard::{Key, Keysym, Modifier, split_key_combination};
+pub use keyboard::{Key, Keysym, Modifier, is_terminal_emulator, split_key_combination};
 pub use keyboard_input::{
   KeyboardBackend, KeyboardHold, KeyboardHoldController, KeyboardHoldId, KeyboardHoldIdentity, keyboard_hold_controller,
 };

@@ -1,4 +1,4 @@
-use crate::{CommandGroup, InvokeCommandInput, InvokeCommandOutput, InvokeCommandResult, invoke_command};
+use crate::{CommandGroup, FailureCode, InvokeCommandInput, InvokeCommandOutput, InvokeCommandResult, InvokeFailure, invoke_command};
 use crate::{InvokeReport, InvokeReportField, InvokeReportSection};
 use clap::Args;
 
@@ -12,35 +12,42 @@ pub fn group() -> CommandGroup {
 
 #[invoke_command(
   id = "app.probePermissions",
-  support = { macos: Supported, linux: Unsupported, windows: Unsupported("the Windows driver has a permission probe that this command does not use") },
+  support = { macos: Supported, linux: Unsupported, windows: Unsupported("the result names macOS privacy permissions; the Windows driver's elevation, UIAccess and session probe has no field in it") },
+  // The Runner-side PermissionService handler is macOS-only, which is a different refusal
+  // reason than the direct Windows note, so the route declares its own cells.
+  runner = {
+    macos: Supported,
+    linux: Unsupported("the Runner's permission service is macOS-only"),
+    windows: Unsupported("the Runner's permission service is macOS-only"),
+  },
   group = "app",
   description = "Probe macOS screen recording, accessibility, and automation permissions.",
   input = ProbePermissionsArgs,
 )]
-async fn probe_permissions(input: InvokeCommandInput, _args: ProbePermissionsArgs) -> InvokeCommandResult {
+async fn probe_permissions(input: InvokeCommandInput, _args: ProbePermissionsArgs) -> crate::InvokeExecutionResult {
   if input.target.is_some() {
-    return Err("app.probePermissions cannot use --target".to_string());
+    return Err("app.probePermissions cannot use --target".to_string().into());
   }
   if input.dry_run {
     return Ok(InvokeCommandOutput::completed());
   }
   let permissions = read_permissions().await?;
-  permission_probe_output(&permissions)
+  Ok(permission_probe_output(&permissions)?)
 }
 
 pub fn permission_probe_output(permissions: &auv_driver::PermissionProbe) -> InvokeCommandResult {
   Ok(InvokeCommandOutput::from_result(permissions)?.with_report(permission_report(permissions)))
 }
 
-pub async fn read_permissions() -> Result<auv_driver::PermissionProbe, String> {
+pub async fn read_permissions() -> Result<auv_driver::PermissionProbe, InvokeFailure> {
   #[cfg(target_os = "macos")]
   {
     let session = auv::local::open().map_err(|error| error.to_string())?;
-    session.permission().probe().map_err(|error| error.to_string())
+    Ok(session.permission().probe().map_err(|error| error.to_string())?)
   }
   #[cfg(not(target_os = "macos"))]
   {
-    Err("app.probePermissions is only available on macOS".to_string())
+    Err(InvokeFailure::new(FailureCode::Unsupported, "app.probePermissions is only available on macOS"))
   }
 }
 
@@ -50,55 +57,70 @@ struct ActivateAppArgs {}
 
 #[invoke_command(
   id = "app.activate",
-  support = { macos: Supported, linux: Unsupported, windows: Unsupported("the Windows driver can activate a process by name, which this command does not use") },
+  support = { macos: Supported, linux: Unsupported("application activation is not implemented on Linux yet"), windows: Supported },
+  runner = Direct,
   target = RequiredApplication,
   group = "app",
-  description = "Bring a target app to the foreground before a foreground-dependent step.",
+  description = "Bring a target app to the foreground before a foreground-dependent step. The target is an application id: a bundle id on macOS, an executable name on Windows (the APP column of window.list, `.exe` optional).",
   input = ActivateAppArgs,
 )]
-async fn activate_app(input: InvokeCommandInput, _args: ActivateAppArgs) -> InvokeCommandResult {
+async fn activate_app(input: InvokeCommandInput, _args: ActivateAppArgs) -> crate::InvokeExecutionResult {
   let result = activate_application(input.application_target()?.map(str::to_string)).await?;
-  activation_output(&result)
+  Ok(activation_output(&result)?)
 }
+
+/// The settle delay `app.activate` waits before checking the foreground, on
+/// both the in-process and the Runner path.
+pub const ACTIVATION_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 pub fn activation_output(result: &auv_driver::ApplicationActivationResult) -> InvokeCommandResult {
   let mut fields = vec![
-    InvokeReportField::new("Requested target", &result.requested_bundle_id),
+    InvokeReportField::new("Requested target", &result.requested_application_id),
+    InvokeReportField::new("Application id kind", result.application_id_kind.as_str()),
     InvokeReportField::new("Result", "activation request completed"),
-    InvokeReportField::new("Verification", result.verification.status()),
+    InvokeReportField::new("Method", result.method.as_str()),
   ];
-  if let Some(observed_bundle_id) = result.verification.observed_bundle_id() {
-    fields.push(InvokeReportField::new("Observed foreground", observed_bundle_id));
+  if let Some(window) = &result.activated_window {
+    fields.push(InvokeReportField::new("Activated window", format!("window:{}", window.id)));
+  }
+  fields.push(InvokeReportField::new("Verification", result.verification.status()));
+  if let Some(observed_application_id) = result.verification.observed_application_id() {
+    fields.push(InvokeReportField::new("Observed foreground", observed_application_id));
   }
   if let auv_driver::ApplicationActivationVerification::Unavailable { reason } = &result.verification {
     fields.push(InvokeReportField::new("Verification detail", reason));
   }
+  // The window observation is a fact separate from the foreground
+  // verification; `None` (this driver did not observe) renders nothing
+  // rather than implying an absence.
+  match &result.window_observation {
+    Some(auv_driver::ActivationWindowObservation::Present { reference }) => {
+      fields.push(InvokeReportField::new("Window observation", "window_present"));
+      fields.push(InvokeReportField::new("Observed window", format!("window:{}", reference.id)));
+    }
+    Some(auv_driver::ActivationWindowObservation::Absent) => {
+      fields.push(InvokeReportField::new("Window observation", "window_absent"));
+    }
+    Some(auv_driver::ActivationWindowObservation::Unknown { reason }) => {
+      fields.push(InvokeReportField::new("Window observation", "window_unknown"));
+      fields.push(InvokeReportField::new("Window observation detail", reason));
+    }
+    None => {}
+  }
   Ok(InvokeCommandOutput::from_result(result)?.with_report(InvokeReport::new(fields, Vec::new())))
 }
 
-pub async fn activate_application(_target_application_id: Option<String>) -> Result<auv_driver::ApplicationActivationResult, String> {
-  let target_application_id = _target_application_id
+/// Activates the target in process through the local driver facade, keeping
+/// driver failures typed: Linux sessions fail as `unsupported`.
+pub async fn activate_application(
+  target_application_id: Option<String>,
+) -> Result<auv_driver::ApplicationActivationResult, crate::InvokeFailure> {
+  let target_application_id = target_application_id
     .as_deref()
     .filter(|value| !value.trim().is_empty())
-    .ok_or_else(|| "app.activate requires --target".to_string())?;
-  #[cfg(target_os = "macos")]
-  {
-    use auv_driver_macos::ApplicationControl;
-
-    let session = auv::local::open().map_err(|error| error.to_string())?;
-    session.activate_bundle_id(target_application_id, std::time::Duration::from_millis(150)).map_err(|error| error.to_string())
-  }
-  #[cfg(not(target_os = "macos"))]
-  {
-    let _ = target_application_id;
-    // TODO(app-activate-windows-cli): auv-driver-windows now implements
-    // process-name activation (`auv_driver_windows::ApplicationControl::
-    // activate_process_name`, returning `ProcessActivationResult`), but this
-    // command's output type is the macOS-specific `ApplicationActivationResult`
-    // (bundle-id shaped). Wiring Windows here needs an owner-approved decision
-    // on the shared CLI output contract before this branch changes.
-    Err("app.activate is only available on macOS".to_string())
-  }
+    .ok_or_else(|| crate::InvokeFailure::new(crate::FailureCode::InvalidTarget, "app.activate requires --target"))?;
+  let session = auv::local::open()?;
+  Ok(session.applications().activate(target_application_id, ACTIVATION_SETTLE)?)
 }
 
 fn permission_report(permissions: &auv_driver::PermissionProbe) -> InvokeReport {

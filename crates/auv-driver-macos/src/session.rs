@@ -206,6 +206,29 @@ impl DisplayApi<'_> {
       ..captured
     })
   }
+
+  /// Capture a display without windows owned by this process, leaving those
+  /// windows visible. Requires ScreenCaptureKit screenshots (macOS 14+).
+  /// Applies the requested resolution after capturing native pixels.
+  /// Never falls back to an unfiltered screenshot if exclusion fails.
+  #[cfg(target_os = "macos")]
+  pub fn capture_excluding_self(&self, options: CaptureOptions) -> DriverResult<DisplayCapture> {
+    if options.window.is_some() || options.region.is_some() || matches!(options.activation, Activation::ActivateFirst { .. }) {
+      return Err(invalid_input("display.capture_excluding_self accepts only display selection and resolution"));
+    }
+    let target = resolve_display_target(&list_display_targets()?, options.display.as_deref())?;
+    let id = target.display.id.parse::<u32>().map_err(|error| invalid_input(format!("invalid native display id: {error}")))?;
+    let pixels = crate::native::capture::capture_display_rgba_without_self(id).map_err(backend)?;
+    let width = u32::try_from(pixels.image_width).map_err(|error| backend(error.to_string()))?;
+    let height = u32::try_from(pixels.image_height).map_err(|error| backend(error.to_string()))?;
+    let image = RgbaImage::from_raw(width, height, pixels.rgba_bytes).ok_or_else(|| backend("invalid native display RGBA image"))?;
+    let scale_factor = f64::from(width) / target.display.frame.size.width;
+    let captured = display_capture(target.display, image, scale_factor, "macos.screencapturekit.excluding_self");
+    Ok(DisplayCapture {
+      capture: captured.capture.at_resolution(options.resolution),
+      ..captured
+    })
+  }
 }
 
 impl WindowApi<'_> {
@@ -268,7 +291,7 @@ impl WindowApi<'_> {
               .as_deref()
               .map(|bundle_id| AppLiveness::from_probe(crate::native::window::running_application_pid(bundle_id)))
               .unwrap_or(AppLiveness::Unknown);
-            not_found(app_resolution_message(&app_selector, liveness))
+            not_found(app_resolution_message(&app_selector, liveness, &snapshot))
           })?;
           snapshot = filtered_snapshot;
           resolved_app
@@ -1107,11 +1130,11 @@ fn matches_app_selector(window: &Window, selector: &AppSelector) -> bool {
   {
     return false;
   }
-  if let Some(bundle) = &selector.bundle {
-    let Some(app_bundle_id) = &window.app_bundle_id else {
+  if let Some(matcher) = &selector.id {
+    let Some(application_id) = &window.application_id else {
       return false;
     };
-    if !matches_text(app_bundle_id, bundle) {
+    if !matches_text(application_id, matcher) {
       return false;
     }
   }
@@ -1140,7 +1163,7 @@ fn window_from_observed(window: &ObservedWindow, is_main: Option<bool>) -> Windo
     },
     title: (!window.title.is_empty()).then(|| window.title.clone()),
     app_name: (!window.app_name.is_empty()).then(|| window.app_name.clone()),
-    app_bundle_id: (!window.owner_bundle_id.is_empty()).then(|| window.owner_bundle_id.clone()),
+    application_id: (!window.owner_bundle_id.is_empty()).then(|| window.owner_bundle_id.clone()),
     process_id: u32::try_from(window.owner_pid).ok(),
     frame: rect_from_observed(&window.bounds),
     coordinate_space: CoordinateSpace::Screen,
@@ -1156,7 +1179,7 @@ fn window_from_native_ref(window: &NativeWindowRef, is_main: Option<bool>) -> Wi
     },
     title: (!window.title.is_empty()).then(|| window.title.clone()),
     app_name: (!window.app_name.is_empty()).then(|| window.app_name.clone()),
-    app_bundle_id: (!window.owner_bundle_id.is_empty()).then(|| window.owner_bundle_id.clone()),
+    application_id: (!window.owner_bundle_id.is_empty()).then(|| window.owner_bundle_id.clone()),
     process_id: u32::try_from(window.owner_pid).ok(),
     frame: rect_from_observed(&window.bounds),
     coordinate_space: CoordinateSpace::Screen,
@@ -1178,8 +1201,8 @@ fn resolve_frontmost_window(snapshot: &ObservedWindowSnapshot, selector: &Window
 }
 
 fn app_selector_string(selector: &AppSelector) -> Option<String> {
-  if let Some(bundle) = &selector.bundle {
-    return matcher_value(bundle).map(ToOwned::to_owned);
+  if let Some(application_id) = &selector.id {
+    return matcher_value(application_id).map(ToOwned::to_owned);
   }
   if let Some(name) = &selector.name {
     return matcher_value(name).map(ToOwned::to_owned);
@@ -1353,9 +1376,15 @@ fn parse_key_combination(options: &PressKeysOptions) -> DriverResult<Vec<i32>> {
       code
     } else {
       let mut chars = name.chars();
+      // A spelled-out character name (`comma`, `bracket_left`) resolves through
+      // the shared key names to the character it names.
       let character = chars
         .next()
         .filter(|_| chars.next().is_none())
+        .or_else(|| match name.parse::<auv_driver_common::Key>() {
+          Ok(auv_driver_common::Key::Symbol(symbol)) => symbol.key_char().filter(char::is_ascii_graphic),
+          _ => None,
+        })
         .ok_or_else(|| invalid_input(format!("invalid key {key:?}; expected one key name or ANSI character")))?;
       implicit_shift |= character.is_ascii_uppercase()
         || matches!(
@@ -1824,7 +1853,7 @@ fn resolve_input_target(target: &auv_driver_common::InputTarget) -> DriverResult
       }
       Ok((pid, number))
     }
-    auv_driver_common::InputTarget::Application { bundle_id } => {
+    auv_driver_common::InputTarget::Application { id: bundle_id } => {
       if bundle_id.trim().is_empty() {
         return Err(invalid_input("application bundle id must not be empty"));
       }
@@ -1888,7 +1917,7 @@ fn foreground_activation_script(window: &Window) -> DriverResult<String> {
     // legacy Window values without an observed owner pid.
     return Ok(format!("tell application \"System Events\" to set frontmost of first application process whose unix id is {pid} to true"));
   }
-  if let Some(bundle_id) = &window.app_bundle_id {
+  if let Some(bundle_id) = &window.application_id {
     return Ok(format!("tell application id \"{}\" to activate", escape_applescript(bundle_id)));
   }
   if let Some(app_name) = &window.app_name {
@@ -1928,6 +1957,21 @@ fn list_display_targets() -> DriverResult<Vec<MacosDisplayTarget>> {
 }
 
 #[cfg(target_os = "macos")]
+fn display_capture(display: Display, image: RgbaImage, scale_factor: f64, backend: &str) -> DisplayCapture {
+  DisplayCapture {
+    capture: Capture {
+      origin: Some(auv_driver_common::Position::in_screen(auv_driver_common::ScreenPoint::from(display.frame.origin))),
+      image,
+      bounds: display.frame,
+      scale_factor,
+      backend: backend.into(),
+      fallback_reason: None,
+    },
+    display,
+  }
+}
+
+#[cfg(target_os = "macos")]
 fn capture_display_xcap(selector: Option<&str>) -> DriverResult<DisplayCapture> {
   let monitors = xcap::Monitor::all().map_err(|error| backend(format!("failed to enumerate displays: {error}")))?;
   let targets = display_targets_from_monitors(&monitors)?;
@@ -1936,18 +1980,8 @@ fn capture_display_xcap(selector: Option<&str>) -> DriverResult<DisplayCapture> 
   let image = monitor.capture_image().map_err(|error| backend(format!("failed to capture display: {error}")))?;
   let image = RgbaImage::from_raw(image.width(), image.height(), image.into_raw())
     .ok_or_else(|| backend("failed to decode captured display RGBA image"))?;
-  let capture = Capture {
-    origin: Some(auv_driver_common::Position::in_screen(auv_driver_common::ScreenPoint::from(target.display.frame.origin))),
-    image,
-    bounds: target.display.frame,
-    scale_factor: target.display.scale_factor,
-    backend: "xcap.macos".to_string(),
-    fallback_reason: None,
-  };
-  Ok(DisplayCapture {
-    display: target.display,
-    capture,
-  })
+  let scale_factor = target.display.scale_factor;
+  Ok(display_capture(target.display, image, scale_factor, "xcap.macos"))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1960,6 +1994,10 @@ fn capture_region_xcap(selector: Option<&str>, region: Rect) -> DriverResult<Reg
   let monitors = xcap::Monitor::all().map_err(|error| backend(format!("failed to enumerate displays: {error}")))?;
   let targets = display_targets_from_monitors(&monitors)?;
   let target = resolve_display_for_global_region(&targets, selector, region)?;
+  // The backend addresses whole capture units, so cover a fractional region
+  // (an OCR box, a layout rect) with whole units inside the display, and
+  // report the covered rect as the capture bounds.
+  let region = region.round_out().intersect(target.display.frame).ok_or_else(|| not_found("display containing region"))?;
   let monitor = monitors.get(target.index).ok_or_else(|| not_found(format!("display index {}", target.index)))?;
   let local_x = integral_capture_dimension("x", region.origin.x - target.display.frame.origin.x)?;
   let local_y = integral_capture_dimension("y", region.origin.y - target.display.frame.origin.y)?;

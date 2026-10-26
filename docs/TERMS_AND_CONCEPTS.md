@@ -65,6 +65,9 @@ enforcing namespaced-name, MIME, count, or encoded-size policies. It continues
 to enforce structural and storage invariants such as identifier shape, finite
 JSON numbers, byte limits, and artifact integrity.
 
+An artifact record carries `occurred_at`: when the evidence was produced (a
+capture's completion), which can precede the record's position in the store.
+
 ## TracingStore
 
 `TracingStore` is the write-only port for full-fidelity trace records and
@@ -72,6 +75,19 @@ artifact bodies. It exposes `write`, `write_artifact`, and `flush`; generic
 lookup, snapshots, pagination, subscriptions, and artifact reads do not belong
 to this producer-side port. Concrete in-memory stores may expose records
 for tests without turning those methods into the generic store contract.
+The file layout has its own sequential reader
+(`FileTracingStore::read_records`), versioned by the `records.jsonl` envelope
+(currently 2). Several processes may append to one file store.
+
+## Trace Context Propagation
+
+A caller's Run and span cross a process boundary as the `auv-trace-version`,
+`auv-trace-run-id`, and `auv-trace-span-id` fields, kept apart from the
+daemon's `auv-run-id` routing header. The daemon forwards trace fields only
+for calls routed to a Run, and only for that Run; a Runner records exactly the
+calls that carry them. A daemon Run id and its trace Run id are the same UUID
+(`RunId::from_daemon_run_id`). See
+[trace and log responsibility split](ai/references/inspect/2026-10-21-trace-and-log-responsibility-split.md).
 
 ## Trace Exporter
 
@@ -79,6 +95,16 @@ for tests without turning those methods into the generic store contract.
 telemetry representation. OpenTelemetry is one exporter. Exporters do not own
 artifact bytes, install application-global providers, or become canonical AUV
 storage.
+
+## Operational Log
+
+An operational log is per-process diagnostic output from the daemon, the
+Runner, or a CLI frontend, written through tokio `tracing` macros. It explains
+why a process failed or was slow. It is not a `TraceRecord`, carries no
+versioned schema, and must never be the only place a replay or inspection fact
+lives. Drivers report recordable facts through typed results and use
+operational logs only for internal detail. See
+[trace and log responsibility split](ai/references/inspect/2026-10-21-trace-and-log-responsibility-split.md).
 
 ## Projection
 
@@ -966,13 +992,18 @@ The current scope terms are `screen`, `display`, `window`, and `region`.
 An execution target identifies the resource an invoke operation acts on. The
 shared invoke model distinguishes `Application`, `Window`, and `Display`
 targets instead of carrying an untyped string. The CLI spells these as
-`app:<bundle-id>`, `window:<window-id>`, and `display:<display-id>`. A bare
-`--target` value retains its historical meaning as an application id.
+`app:<application-id>`, `window:<window-id>`, and `display:<display-id>`. A
+bare `--target` value retains its historical meaning as an application id.
 
 What an application id names depends on the platform. The `window.*` commands match a bundle id
 on macOS, the AT-SPI `AccessibleId` on Linux, and the executable file name on Windows (for
 example `notepad.exe`, matched ignoring ASCII case), each as `window.list` shows it. See the
 [Windows window commands reference](ai/references/invoke-cli/2026-10-11-windows-window-commands.md).
+
+`app.activate` reports the kind of id it activated: `bundle_id` on macOS and
+`process_name` (the executable name) on Windows. The Linux Wayland kind
+`desktop_app_id` (the AT-SPI application id) is defined, but Wayland activation
+is not implemented yet.
 
 Each command definition declares whether a target is forbidden, optional, or
 required and which resource types it accepts. CLI help and MCP metadata derive
@@ -1165,7 +1196,7 @@ elements that overlap multiple layout or backing surfaces.
 
 A window candidate is one possible window match returned by a window-listing
 operation. Candidates should include enough metadata for inspection and stable
-selection, such as window ref, native window id when available, owner bundle id,
+selection, such as window ref, native window id when available, owner application id,
 owner pid, title, bounds, display relationship, layer, area, visibility, and the
 reason it appears in the ordered list.
 
@@ -1523,6 +1554,18 @@ platforms.
   system, not by AUV: a window may become the foreground window only if its process holds the
   right to, and an application that merely activates itself inside its own input queue does
   not. See the [background session reference](ai/references/driver/2026-10-10-windows-background-session.md).
+- A posted message carries only what is in it. It does not move the cursor, change the focus or
+  the foreground, or update the key-state table the target thread reads. An application that
+  consults any of those before acting diverges from one that trusts the message. This one rule
+  covers the Windows findings so far:
+  - a posted Ctrl+A arrives as the letter `a`, because `GetKeyState(VK_CONTROL)` still reads 0
+    ([targeted keyboard probe](ai/references/driver/2026-10-12-windows-targeted-keyboard-probe.md));
+  - Chromium may redirect a posted wheel by the point it names rather than by the window it was
+    posted to (an open REVIEW in the background session reference);
+  - XAML content ignores posted mouse messages.
+
+  It is not a rule about toolkits. A Chromium page counts posted clicks
+  ([support matrix](SUPPORT_MATRIX.md#windows-background-session-by-application)).
 - A **frame stream** is the session's continuously drained capture of one window. It keeps only
   the newest frame and counts the frames the compositor delivers, so a read is never an older
   state of the window, a window that has not changed costs no pixel copy
@@ -1553,6 +1596,23 @@ path actually used. Click cardinality is a separate option and may request a
 single, double, or explicitly counted repeated click with an interval. An
 omitted interval for a repeated click means `Click::DEFAULT_INTERVAL` (75 ms)
 on every frontend and Runner.
+
+Only a foreground step restores a minimized window. That means:
+
+- `foreground_preferred` delivery;
+- an activation command such as `app.activate`;
+- a `background_preferred` action that fell back to foreground input.
+
+`background_only` never restores. It refuses a minimized target or reports it skipped, as the
+[background session](#background-session) does with `skipped_minimized`.
+
+The owner accepted this rule on 2026-10-13
+([consolidation review](ai/references/invoke-cli/2026-10-13-windows-parity-consolidation-review.md#24-appactivate-and-resolution-b)).
+It replaces the earlier wording "an activation is explicit user intent", which said nothing about
+input modes.
+
+On Windows, direct posted clicks and wheels do not check yet. They post to a minimized window and
+report delivery (`TODO(windows-posted-minimized)` in `auv-driver-windows`).
 
 `MouseButton` selects left, right, or middle for a complete click. Window
 `ClickOptions` and wire options default to left when omitted; Rust screen-click
@@ -1645,8 +1705,12 @@ Scroll until is a bounded observation loop:
   caller opts out.
 - **Stop reasons:**
   - `text_visible`: OCR finds the query.
-  - `end_by_no_visual_progress`: a configured number of consecutive steps
-    showed no pixel motion.
+  - `end_by_no_visual_progress`: the viewport moved, then a configured
+    number of consecutive steps showed no pixel motion.
+  - `no_visual_progress_from_start`: the same number of steps showed no pixel
+    motion, and no step moved the viewport. Content already at its end, an
+    application that ignored every step, and motion outside the motion region
+    look the same, so it is never evidence of an end.
   - `budget_exhausted`: the step budget ran out.
   - `predicate_satisfied`: the caller's predicate stopped the loop. Over the
     Runner protocol, the predicate runs on the client, and the Runner waits
@@ -1655,7 +1719,8 @@ Scroll until is a bounded observation loop:
   motion), shared with the NetEase sidebar policy.
 - **What "end" means:** an observation, not proof that no more content
   exists. A slow lazy load, an occluded window, or capture failure can look
-  like an end.
+  like an end. Only `end_by_no_visual_progress` is reported as one, because
+  it needs motion before the stillness.
 - **Where it runs:** on the Runner (`InputService/ScrollUntil`), so captures
   stay local. It is reachable through `auv invoke input.scrollUntil` and the
   Rust and JS clients.
@@ -1686,6 +1751,30 @@ Verification is `verified_foreground` only when a platform observation reports
 the requested application as frontmost. A mismatched observation or unavailable
 observation is an explicit activation-only outcome; callers must not promote it
 to semantic success or recover that claim by taking an unrelated screenshot.
+
+One result type serves every platform. It records:
+
+- `requested_application_id` and `application_id_kind`: the application id
+  from the request (see [Execution Target](#execution-target)) and which
+  platform identity it names. The kind is part of the wire contract.
+- `method`: how the platform delivered the request. macOS uses
+  `apple_script_activate`. Windows uses `foreground_window`, which foregrounds
+  the application's main visible window.
+- `activated_window`: the window reference the platform foregrounded, when
+  activation went through one window (Windows). It is absent on macOS.
+- `verification`: the status above, with `observed_application_id` when a
+  foreground application was observed.
+
+The result has no focus-disturbance field, because activation changes focus by
+definition. It has no attempts or fallback reasons yet, because every platform
+has one strategy.
+
+The CLI command is `app.activate`. The Runner API is
+`auv.api.driver.v1.ApplicationService/ActivateApplication`. The SDKs call it as
+`runner.applications().activate(...)` in Rust and
+`auv.applications.activate({ applicationId })` in JavaScript. A platform
+without activation, which is Linux today, fails with an `unsupported` error
+(gRPC `UNIMPLEMENTED`). It never returns an activation-only result.
 
 ## Action Executor
 

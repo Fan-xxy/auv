@@ -17,7 +17,7 @@ UIA, and `Windows.Media.Ocr`.
 - UIA accessibility tree capture, node focus, node select
 - Process-level permission probe (elevation, UIAccess, interactive session)
 - Readiness assessment: combines the permission probe with window presence, frontmost, frame-drift, and input-injection-target checks
-- App-level activation by process name (`ApplicationControl::activate_process_name`)
+- App-level activation by process image name (`ApplicationApi::activate`, served as `auv.api.driver.v1.ApplicationService/ActivateApplication` and `auv invoke app.activate`)
 - Overlay visual adapter (cursor, outline, status layers) via `auv-driver-overlay-windows`, drawn with Direct2D/DirectWrite (real alpha, antialiasing, SVG cursor art, cursor shadows blurred from the art's silhouette)
 - Background session (`WindowsDriverSession::background`): up to five target windows operated and watched without ever foregrounding them. Window-message click and wheel only (no input policy, no foreground route), cached targets revalidated by one handle probe per operation, typed `done` / `skipped_minimized` / `target_lost` / `unsupported` / `failed` answers, and a continuously drained per-window capture stream that never serves a stale frame ([reference](../../docs/ai/references/driver/2026-10-10-windows-background-session.md))
 - Live overlay that follows delivered input (`OverlayApi::follow_operations`, `overlay` feature): one cursor per window in its own color that springs to each point, tilting as it moves, click ripples and window marks at 60 fps, drawn from what the driver reports and never sending input, plus a caller-written status beside each window's cursor (`OperationFollower::set_status`) ([reference](../../docs/ai/references/driver/2026-10-10-windows-overlay-motion.md))
@@ -32,13 +32,13 @@ UIA, and `Windows.Media.Ocr`.
 | `TODO(windows-window-capture-dpi)` | `src/capture.rs` | Tighter DPI/border mapping for window capture |
 | `TODO(windows-ax-value-write)` | `src/accessibility.rs` | UIA `ValuePattern` writes |
 | `TODO(windows-driver)` | `src/descriptor.rs` | Extend capability strings as slices land |
-| `TODO(app-activate-windows-cli)` | `crates/auv-cli-invoke/src/commands/app.rs` | Wire `activate_process_name` into the `app.activate` CLI command (needs an owner decision on the shared output contract) |
 | `TODO(driver-overlay-windows-outline-label)` | `crates/auv-driver-overlay-windows/src/window.rs` | Outline label layout differs from macOS |
 | `TODO(overlay-follow-other-input)` | `src/overlay_follow.rs` | Scroll, key, text and held-button delivery do not report to the live overlay |
 | `TODO(overlay-follow-remote-runner)` | `src/overlay_follow.rs` | Events are reported in the process that delivers input; a remote Runner needs the same hook |
 | `TODO(overlay-follow-multi-mouse)` | `src/session.rs` | Only the shared default mouse drives the live cursors |
 | `TODO(overlay-live-status-producers)` | `src/overlay_follow.rs` | Only Rust callers can set a cursor status; `auv invoke`, MCP and the Runner do not start a follower |
 | `TODO(windows-targeted-keyboard)` | `src/input.rs`, `src/background_session.rs` | Background keyboard delivery; a session answers keyboard requests as `unsupported` |
+| `TODO(windows-posted-minimized)` | `src/background_input.rs` | Direct posted clicks and wheels do not refuse a minimized target under `background_only` |
 | `TODO(windows-background-cloaked)` | `src/background_session.rs` | A window DWM cloaks (another virtual desktop) is treated as live; it needs its own typed state and live evidence |
 | `TODO(background-session-wait-for-frame)` | `src/background_session.rs` | A blocking wait for the next frame; callers poll `capture`, which answers `Unchanged` without copying |
 | `TODO(background-session-foreground-grant)` | `src/background_session.rs` | A delivery reports no focus disturbance without observing it; a just-launched process can still take the foreground on its first activation |
@@ -59,9 +59,11 @@ control hit-tested under the target point via `PostMessageW`, after descending t
 UIA-adjacent Win32 child hierarchy with `ChildWindowFromPointEx`. This never raises,
 focuses, or activates the window, unlike `SendInput`. Delivery is best-effort:
 `PostMessageW` succeeding only means the message was queued, not that the target
-processed it — classic Win32/MFC/WinForms controls handle it reliably, while
-Chromium/Electron/WinUI/UWP surfaces and most GPU-rendered custom UI read real HID
-input instead and silently ignore posted messages. Windows has no second, more
+processed it. A posted message carries only what is in it (no cursor, focus or key
+state), so whether an application acts on it varies per application: classic Win32
+controls do, XAML content ignores posted mouse input, and a Chromium page counts
+posted clicks but did not scroll on a posted wheel while covered (see the support
+matrix's "Windows Background Session By Application" table). Windows has no second, more
 compatible route today, so `ClickOptions::window_strategy`'s two variants
 (`ChromiumCompatible`/`PidTargeted`) both resolve to this same delivery on Windows.
 

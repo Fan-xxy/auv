@@ -63,28 +63,17 @@ left corner shows the active Device; click it to open the device picker. Several
 daemons can stay connected at once: pick any Device they report (or the mock
 desktop) to make it the one scripts, the canvas and live view use. Switching is
 disabled while a run is in progress. To control a real Device, choose
-**Add a device…** and pick one of two modes:
+**Add a device…**. The daemon's remote listener only accepts paired Devices,
+so start it and create a one-time token on the daemon host:
 
-- **Local · no pairing** (same machine, development): a loopback listener
-  without a pairing store accepts local connections without a credential.
+```sh
+auv serve --remote-bind 127.0.0.1:9847
+auv devices pair create-token
+```
 
-  ```sh
-  auv serve --listen http://127.0.0.1:9847
-  ```
-
-  Then press **Connect**.
-
-- **Paired**: start the daemon with a pairing store, so its HTTP listener
-  requires a paired Device credential, and create a one-time token on the
-  daemon host:
-
-  ```sh
-  auv serve --listen http://127.0.0.1:9847 --pairing-store ~/.auv/pairings.json
-  auv devices pair create-token
-  ```
-
-  Paste the token and press **Pair**. The browser keeps the credential and
-  reconnects with it on the next visit.
+Paste the token and press **Pair**. The browser keeps the credential and
+reconnects with it on the next visit. To reuse a Device credential that you
+already have, paste it instead and press **Connect**.
 
 Daemons that were connected when the page closed reconnect on the next visit,
 and the previously active Device is restored. **Disconnect** keeps a daemon in
@@ -136,7 +125,7 @@ is the SDK's (`sdk.region`, `sdk.below`, … with the same rules as Rust's
 at its center.
 
 ```ts
-const music = await auv.windows.resolve({ bundleId: 'com.netease.163music' })
+const music = await auv.windows.resolve({ applicationId: 'com.netease.163music' })
 const search = area(music).region({ height: 36, left: 400, top: 32, width: 256 }).named('search')
 const results = area(music).region({ bottom: 80, left: '22%', top: 120 }) // % follows resizes
 draw(search) // editor only: outline it on the desktop canvas
@@ -157,7 +146,7 @@ the image; match bounds stay in screen space.
 const sidebar = area(music).region({ width: '30%' })
 const hits = await music.findText('Remember', { screenRegion: sidebar })
 const ocr = await auv.recognizeText((await music.capture()).capture!, { screenRegion: sidebar })
-await auv.macos.applications.activateBundleId({ bundleId: 'com.netease.163music' })
+await auv.applications.activate({ applicationId: 'com.netease.163music' })
 ```
 
 `focus(target, { zoom = true, autoZoomOut = true })` eases the desktop canvas
@@ -198,9 +187,11 @@ defaults (50 steps, 2 confirmations, 400 ms), the same as
 `auv invoke input.scrollUntil`. The mock desktop applies
 `sdk.SCROLL_UNTIL_DEFAULTS`, the same values.
 
-An `END_BY_NO_VISUAL_PROGRESS` stop means no visual motion was observed, not
-that no content is left. On the mock desktop, the Music window's song list
-scrolls (other windows do not):
+An `END_BY_NO_VISUAL_PROGRESS` stop means the view moved, then stopped moving;
+it is not proof that no content is left. `NO_VISUAL_PROGRESS_FROM_START` means
+no step moved the view at all, so the window may have ignored the scroll. On the
+mock desktop, the Music window's song list scrolls (other windows do not, and
+stop with `NO_VISUAL_PROGRESS_FROM_START`):
 
 ```ts
 const music = await auv.windows.resolve({ appName: 'Music' })
@@ -222,7 +213,7 @@ and focused first, so the text cannot land in another app.
 focus when they run, which can be this playground's browser.
 
 ```ts
-const music = await auv.windows.resolve({ bundleId: 'com.netease.163music' })
+const music = await auv.windows.resolve({ applicationId: 'com.netease.163music' })
 await music.click({ x: 528, y: 50 }) // the search box, window-relative
 await music.typeText('Reply 超时空辉夜姬')
 await music.pressKeys('return')

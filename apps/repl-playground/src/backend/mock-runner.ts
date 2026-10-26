@@ -6,6 +6,8 @@ import type { MockDesktop } from './mock-desktop'
 import type { DisplayInfo, WindowInfo } from './types'
 
 import {
+  ApplicationActivationMethod,
+  ApplicationIdKind,
   ApplicationService,
   AuvRpcError,
   CaptureResolution,
@@ -167,7 +169,7 @@ export function mockRunner(desktop: MockDesktop): Transport {
         const application = request.selector?.application
         const title = request.selector?.window
         const found = desktop.windows().find(candidate =>
-          (application?.case !== 'applicationBundleId' || candidate.bundleId === application.value)
+          (application?.case !== 'applicationId' || candidate.applicationId === application.value)
           && (application?.case !== 'applicationName' || candidate.app === application.value)
           && (application?.case !== 'processId' || candidate.pid === application.value)
           && (title?.case !== 'titleExact' || candidate.title === title.value)
@@ -263,8 +265,8 @@ export function mockRunner(desktop: MockDesktop): Transport {
         const recipient = request.target?.recipient
         if (recipient?.case === 'window')
           window(recipient.value.ref?.windowId)
-        else if (recipient?.case === 'applicationBundleId' && !desktop.hasApplication(recipient.value))
-          throw new AuvRpcError(NOT_FOUND, `No running application with bundle ID ${recipient.value}`)
+        else if (recipient?.case === 'applicationId' && !desktop.hasApplication(recipient.value))
+          throw new AuvRpcError(NOT_FOUND, `No running application with application ID ${recipient.value}`)
         const path = recipient?.case === 'window' ? InputDeliveryPath.WINDOW_TARGETED_KEYBOARD : InputDeliveryPath.FOREGROUND_SYSTEM_EVENTS
         const actions = []
         for (const input of request.inputs) {
@@ -312,11 +314,13 @@ export function mockRunner(desktop: MockDesktop): Transport {
           const frame = capture(target.frame, desktop.displayAt(target.frame).scale, { case: 'windowId', value: target.id })
           const regions = desktop.text(target.frame)
           streak = moved ? 0 : streak + 1
+          // Motion resets the streak, so a streak as long as the step count means nothing moved.
+          const neverMoved = streak === steps
           const match = query ? regions.find(region => region.text.toLowerCase().includes(query.toLowerCase())) : undefined
           const stop = match
             ? ScrollUntilStopReason.TEXT_VISIBLE
             : streak >= noMotionConfirmations
-              ? ScrollUntilStopReason.END_BY_NO_VISUAL_PROGRESS
+              ? neverMoved ? ScrollUntilStopReason.NO_VISUAL_PROGRESS_FROM_START : ScrollUntilStopReason.END_BY_NO_VISUAL_PROGRESS
               : steps >= maxSteps ? ScrollUntilStopReason.BUDGET_EXHAUSTED : ScrollUntilStopReason.UNSPECIFIED
           const motion = { estimatedShift: moved ? Math.round(step.deltaY || step.deltaX) : 0, noMotion: !moved, normalizedDiff: moved ? 1 : 0 }
           const total = { deltaX: step.deltaX * steps, deltaY: step.deltaY * steps }
@@ -359,11 +363,18 @@ export function mockRunner(desktop: MockDesktop): Transport {
     })
 
     service(ApplicationService, {
-      activateBundleId: async (request) => {
+      // The mock desktop names applications by bundle ID, so it answers like a
+      // macOS Runner.
+      activateApplication: async (request) => {
         await delay(LATENCY_MS.key)
-        if (!desktop.hasApplication(request.bundleId))
-          throw new AuvRpcError(NOT_FOUND, `No running application with bundle ID ${request.bundleId}`)
-        return { requestedBundleId: request.bundleId, verification: { verification: { case: 'verifiedForeground', value: { observedBundleId: request.bundleId } } } }
+        if (!desktop.hasApplication(request.applicationId))
+          throw new AuvRpcError(NOT_FOUND, `No running application with bundle ID ${request.applicationId}`)
+        return {
+          applicationIdKind: ApplicationIdKind.BUNDLE_ID,
+          method: ApplicationActivationMethod.APPLE_SCRIPT_ACTIVATE,
+          requestedApplicationId: request.applicationId,
+          verification: { verification: { case: 'verifiedForeground', value: { observedApplicationId: request.applicationId } } },
+        }
       },
     })
   })
@@ -400,7 +411,7 @@ function thumbHashOf(canvas: OffscreenCanvas): Uint8Array {
 
 function windowMessage(window: WindowInfo) {
   return {
-    applicationBundleId: window.bundleId,
+    applicationId: window.applicationId,
     applicationName: window.app,
     frame: window.frame,
     isMain: true,

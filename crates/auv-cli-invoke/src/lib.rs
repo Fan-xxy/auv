@@ -17,6 +17,7 @@ pub mod registry;
 pub mod render;
 pub mod runner;
 pub mod support;
+pub mod trace;
 
 pub use auv_cli_invoke_macros::invoke_command;
 pub use command::{
@@ -33,7 +34,7 @@ pub use models::{
 pub(crate) use models::{InvokeReportValue, OptionalReportText};
 pub use registry::{InvokeRegistry, default_registry};
 pub use render::{InvokeCliOutcome, render_invoke_result};
-pub use support::{CommandRole, CommandSupport, Platform, PlatformSupport, SupportState};
+pub use support::{CommandRole, CommandSupport, Platform, PlatformSupport, RunnerSupport, SupportState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvokeCliParse {

@@ -15,7 +15,7 @@ type NativeWindow = WindowClient['window']
 const RUNNER_CLASS = 'auv.core.local'
 
 export interface AuvBackendOptions {
-  /** Paired Device credential; omit for a local loopback daemon without a pairing store. */
+  /** Paired Device credential. The daemon rejects calls without one. */
   credential?: string
   /** Stable Device ID to route operations to; the daemon's local Device when omitted. */
   deviceId?: string
@@ -203,7 +203,7 @@ export function toRect(rect: undefined | { height: number, width: number, x: num
 export function toWindow(window: NativeWindow): WindowInfo {
   return {
     app: window.applicationName,
-    bundleId: window.applicationBundleId,
+    applicationId: window.applicationId,
     frame: toRect(window.frame) ?? { height: 0, width: 0, x: 0, y: 0 },
     id: window.ref?.windowId ?? '',
     pid: window.processId,

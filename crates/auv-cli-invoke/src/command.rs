@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde::de::{DeserializeOwned, IntoDeserializer, Visitor, value::MapDeserializer};
 
 use crate::InvokeReport;
-use crate::support::{CommandRole, CommandSupport};
+use crate::support::{CommandRole, CommandSupport, RunnerSupport};
 
 pub type InvokeCommandFuture = std::pin::Pin<Box<dyn std::future::Future<Output = InvokeExecutionResult> + Send + 'static>>;
 pub type InvokeCommandHandler = fn(InvokeCommandInput) -> InvokeCommandFuture;
@@ -264,22 +264,66 @@ impl From<auv_driver::KeyboardInputError> for InvokeFailure {
   }
 }
 
+/// Failure-code classification shared by every Runner-route error that exposes
+/// a protocol-neutral transport category. `None` means the error carried no
+/// transport category, which is no more specific than `backend`.
+fn client_failure_code(kind: Option<auv::error::ClientErrorKind>) -> FailureCode {
+  use auv::error::ClientErrorKind;
+  match kind {
+    Some(ClientErrorKind::NotFound) => FailureCode::NotFound,
+    Some(ClientErrorKind::Unsupported) => FailureCode::Unsupported,
+    Some(ClientErrorKind::Unauthorized) => FailureCode::PermissionDenied,
+    Some(ClientErrorKind::InvalidRequest) => FailureCode::InvalidInput,
+    Some(ClientErrorKind::Conflict | ClientErrorKind::Ambiguous) => FailureCode::StaleUiReference,
+    _ => FailureCode::Backend,
+  }
+}
+
 impl From<auv::client::runner::CapabilityError> for InvokeFailure {
   fn from(error: auv::client::runner::CapabilityError) -> Self {
-    use auv::error::ClientErrorKind;
-    let code = match error.client_kind() {
-      Some(ClientErrorKind::NotFound) => FailureCode::NotFound,
-      Some(ClientErrorKind::Unsupported) => FailureCode::Unsupported,
-      Some(ClientErrorKind::Unauthorized) => FailureCode::PermissionDenied,
-      Some(ClientErrorKind::InvalidRequest) => FailureCode::InvalidInput,
-      Some(ClientErrorKind::Conflict | ClientErrorKind::Ambiguous) => FailureCode::StaleUiReference,
-      _ => FailureCode::Backend,
-    };
-    let mut failure = Self::new(code, error.to_string());
+    let mut failure = Self::new(client_failure_code(error.client_kind()), error.to_string());
     if let auv::client::runner::CapabilityError::KeyboardInput { progress, .. } = error {
       failure.keyboard_progress = Some(progress);
     }
     failure
+  }
+}
+
+impl From<auv::client::PlacementError> for InvokeFailure {
+  fn from(error: auv::client::PlacementError) -> Self {
+    use auv::client::PlacementError;
+    match error {
+      // Daemon control RPCs fail with the same transport categories as
+      // capability RPCs, so they share the classification.
+      PlacementError::Client(error) => Self::new(client_failure_code(Some(error.kind())), error.to_string()),
+      PlacementError::Context(context) => match &context {
+        // The two context-resolution steps that wrap a daemon control RPC
+        // failure classify with the same shared rule; the ContextError Display
+        // keeps each step's own wording ("paired daemon ListDevices failed:
+        // ...", "failed to look up Run on <location>: ...").
+        auv::ContextError::RemoteDeviceList(error) | auv::ContextError::RunLookup { error, .. } => {
+          Self::new(client_failure_code(Some(error.kind())), context.to_string())
+        }
+        // The selected Run does not exist on any reachable daemon; the type
+        // states exactly that, so it classifies as not found.
+        auv::ContextError::RunNotFound(_) => Self::new(FailureCode::NotFound, context.to_string()),
+        // TODO(runner-placement-failure-codes): the free-form Context
+        // variants below keep command_failed; see the marker on the final arm.
+        _ => Self::from(context.to_string()),
+      },
+      // Runner placement re-surfaces capability failures; reuse the shared
+      // conversion so keyboard progress survives.
+      PlacementError::Capability(error) => error.into(),
+      // TODO(runner-placement-failure-codes): Selection, ContextEnvironment,
+      // and Cleanup mix unknown ids, environment problems, and compound
+      // cleanup text, and the remaining placement-semantic Context variants
+      // (RunAmbiguous, DeviceSelectionAmbiguous, DeviceNotConfigured) need a
+      // multiple-matches-versus-configuration distinction the current codes
+      // do not carry — classifying them is an owner decision, not a guess.
+      // They keep command_failed until an owner-approved slice classifies
+      // them.
+      other => Self::from(other.to_string()),
+    }
   }
 }
 
@@ -324,6 +368,9 @@ pub struct InvokeCommand {
   pub target: TargetPolicy,
   /// Where the direct local path exists, declared by the command and shown by help and MCP metadata.
   pub support: CommandSupport,
+  /// How the command relates to the selected-Runner route; required on every
+  /// registered command. See [`crate::support::RunnerSupport`].
+  pub runner: RunnerSupport,
   pub role: CommandRole,
   typed_command: fn(&'static str, &'static str) -> Command,
   typed_parse: InvokeCommandParser,
@@ -362,16 +409,18 @@ impl TargetPolicy {
   pub fn help(self) -> &'static str {
     match self {
       Self::Forbidden => "Target forbidden; this command operates without target selection.",
-      Self::OptionalApplication => "Optional app:<bundle-id> (bare ids accepted); window and display targets are unsupported.",
-      Self::RequiredApplication => "Required app:<bundle-id> (bare ids accepted); window and display targets are unsupported.",
+      Self::OptionalApplication => "Optional app:<application-id> (bare ids accepted); window and display targets are unsupported.",
+      Self::RequiredApplication => {
+        "Required app:<application-id> (the id window.list reports: a bundle id on macOS, an executable name on Windows; bare ids accepted); window and display targets are unsupported."
+      }
       Self::OptionalKeyboard => {
-        "Optional app:<bundle-id> (bare ids accepted) or window:<window-id>. Default foreground-preferred activates the app; a window target also requires exact window focus. Background policies do not activate or fall back to foreground. Does not establish text-control focus. Without target, uses current foreground focus. Display targets are unsupported."
+        "Optional app:<application-id> (bare ids accepted) or window:<window-id>. Default foreground-preferred activates the app; a window target also requires exact window focus. Background policies do not activate or fall back to foreground. Does not establish text-control focus. Without target, uses current foreground focus. Display targets are unsupported."
       }
       Self::OptionalPoint => {
-        "Optional app:<bundle-id>, window:<window-id>, or display:<display-id>; coordinate basis defaults from target. Bare values select an application."
+        "Optional app:<application-id>, window:<window-id>, or display:<display-id>; coordinate basis defaults from target. Bare values select an application."
       }
       Self::RequiredWindow => {
-        "Required app:<bundle-id> (its main visible window; bare ids accepted) or window:<window-id>; coordinates are window-local. Display targets are unsupported."
+        "Required app:<application-id> (its main visible window; bare ids accepted) or window:<window-id>; coordinates are window-local. Display targets are unsupported."
       }
     }
   }
@@ -421,19 +470,79 @@ impl InvokeCommand {
     self
   }
 
+  /// The selected-Runner route's per-platform cells, or `None` when the command
+  /// has no Runner route. Help and MCP metadata render from these cells, so
+  /// every surface states the same route facts.
+  pub fn runner_cells(&self) -> Option<CommandSupport> {
+    self.runner.cells(self.support)
+  }
+
   pub fn with_role(mut self, role: CommandRole) -> Self {
     self.role = role;
     self
   }
 
+  /// Runs the command on the local driver inside one recorded command span;
+  /// see [`crate::trace`].
   pub fn invoke(&self, input: InvokeCommandInput) -> InvokeCommandFuture {
-    if let Err(error) = input.cancellation.check() {
-      return Box::pin(async move { Err(error.to_string().into()) });
+    let command = self.clone();
+    Box::pin(crate::trace::record_command(input, crate::trace::Execution::Local, move |input| {
+      if let Err(error) = input.cancellation.check() {
+        return Box::pin(async move { Err(error.to_string().into()) }) as InvokeCommandFuture;
+      }
+      if let Err(failure) = command.validate(&input) {
+        return Box::pin(async move { Err(failure) });
+      }
+      (command.handler)(input)
+    }))
+  }
+
+  /// Checks the target and the protocol input keys before any frontend runs
+  /// the command locally or routes it to a Runner.
+  pub fn validate(&self, input: &InvokeCommandInput) -> Result<(), InvokeFailure> {
+    self.target.validate(input).map_err(|message| InvokeFailure::new(FailureCode::InvalidTarget, message))?;
+    self.validate_input_keys(input).map_err(|message| InvokeFailure::new(FailureCode::InvalidInput, message))
+  }
+
+  /// Rejects protocol input keys that the command does not declare.
+  ///
+  /// Protocol callers (MCP, Runner, library) pass `inputs` as a free-form map
+  /// that serde decodes leniently, so a misspelled or invented key such as
+  /// `timeout` was dropped and the command ran with its default. CLI calls
+  /// carry clap-parsed `typed_args`, which clap already checked.
+  fn validate_input_keys(&self, input: &InvokeCommandInput) -> Result<(), String> {
+    if input.typed_args.is_some() {
+      return Ok(());
     }
-    if let Err(error) = self.target.validate(&input) {
-      return Box::pin(async move { Err(InvokeFailure::new(FailureCode::InvalidTarget, error)) });
+    let mut accepted = self.input_arguments().iter().map(input_key).collect::<Vec<_>>();
+    // NOTICE: `target` stays accepted as an input key because
+    // `InvokeCommandInput::application_target` falls back to it when a protocol
+    // caller leaves the top-level target empty.
+    if self.target != TargetPolicy::Forbidden {
+      accepted.push("target".to_string());
     }
-    (self.handler)(input)
+    // `overlay` is the protocol spelling of `--no-overlay` (see `crate::parse_cli`);
+    // it is a presentation switch, so error messages do not advertise it.
+    let unknown = input.inputs.keys().filter(|key| *key != "overlay" && !accepted.contains(key)).map(String::as_str).collect::<Vec<_>>();
+    if unknown.is_empty() {
+      return Ok(());
+    }
+    Err(format!(
+      "{} does not accept input {}; accepted inputs: {}",
+      self.id,
+      unknown.join(", "),
+      if accepted.is_empty() {
+        "none".to_string()
+      } else {
+        accepted.join(", ")
+      },
+    ))
+  }
+
+  /// The command-local arguments a protocol caller may pass as `inputs`,
+  /// each keyed by [`input_key`].
+  pub fn input_arguments(&self) -> Vec<Arg> {
+    self.clap_command().get_arguments().filter(|argument| argument.get_id() != "help").cloned().collect()
   }
 
   pub fn clap_command(&self) -> Command {
@@ -443,6 +552,12 @@ impl InvokeCommand {
   pub fn parse_cli_args(&self, arguments: &[String]) -> Result<InvokeCommandCliParse, String> {
     (self.typed_parse)(self.id, self.description, self.target, arguments)
   }
+}
+
+/// The protocol `inputs` key of a command argument: its long name, or its id
+/// for a positional argument. The MCP catalog and input validation share it.
+pub fn input_key(argument: &Arg) -> String {
+  argument.get_long().unwrap_or_else(|| argument.get_id().as_str()).to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -485,6 +600,7 @@ pub fn typed_spec<T>(
   namespace: InvokeNamespace,
   description: &'static str,
   support: CommandSupport,
+  runner: RunnerSupport,
   handler: InvokeCommandHandler,
 ) -> InvokeCommand
 where
@@ -496,6 +612,7 @@ where
     description,
     target: TargetPolicy::default(),
     support,
+    runner,
     role: CommandRole::Desktop,
     typed_command: typed_command::<T>,
     typed_parse: parse_cli_args::<T>,
@@ -511,19 +628,9 @@ where
   if let Some(args) = input.typed_args.as_ref().and_then(TypedInvokeArgs::get::<T>) {
     return Ok(args.clone());
   }
-  let mut protocol_inputs = input.inputs.clone();
-  let command = T::augment_args(Command::new("invoke-command").disable_help_flag(true));
-  for argument in command.get_arguments() {
-    let Some(long) = argument.get_long() else {
-      continue;
-    };
-    let id = argument.get_id().as_str();
-    if !protocol_inputs.contains_key(long)
-      && let Some(value) = protocol_inputs.get(id).cloned()
-    {
-      protocol_inputs.insert(long.to_string(), value);
-    }
-  }
+  // Keys are the declared long names; `InvokeCommand::validate` rejects any other
+  // spelling before a handler decodes them.
+  let protocol_inputs = &input.inputs;
   let values = protocol_inputs.iter().map(|(name, value)| (name.as_str().into_deserializer(), ProtocolValue(value)));
   T::deserialize(MapDeserializer::<_, serde::de::value::Error>::new(values)).map_err(|error| error.to_string())
 }
@@ -705,3 +812,7 @@ pub(crate) fn with_invoke_context(command: Command, target: TargetPolicy) -> Com
     .arg(Arg::new("auv_detail").long("detail").action(ArgAction::SetTrue).help("Include diagnostic detail in human output."))
     .arg(Arg::new("auv_wide").long("wide").action(ArgAction::SetTrue).help("Include extra columns in human table output."))
 }
+
+#[cfg(test)]
+#[path = "command_test.rs"]
+mod tests;

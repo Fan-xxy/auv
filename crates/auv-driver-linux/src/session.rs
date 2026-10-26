@@ -1,5 +1,6 @@
 use std::thread;
 
+use auv_driver_common::application::{ApplicationActivationResult, ApplicationIdKind, unsupported_activation};
 use auv_driver_common::capture::{Activation, Capture, CaptureOptions, DisplayCapture, RegionCapture};
 use auv_driver_common::display::ObservedDisplays;
 use auv_driver_common::error::DriverResult;
@@ -58,6 +59,12 @@ pub struct ClipboardApi<'a> {
   session: &'a LinuxDriverSession,
 }
 
+/// Application activation, matching the macOS and Windows `ApplicationApi`.
+#[derive(Clone, Copy, Debug)]
+pub struct ApplicationApi<'a> {
+  session: &'a LinuxDriverSession,
+}
+
 impl LinuxDriverSession {
   pub fn display(&self) -> DisplayApi<'_> {
     DisplayApi { session: self }
@@ -86,6 +93,22 @@ impl LinuxDriverSession {
   pub fn clipboard(&self) -> ClipboardApi<'_> {
     ClipboardApi { session: self }
   }
+
+  pub fn applications(&self) -> ApplicationApi<'_> {
+    ApplicationApi { session: self }
+  }
+}
+
+impl ApplicationApi<'_> {
+  /// Fails as unsupported before delivering anything, so it never reports an
+  /// activation-only result.
+  // TODO(wayland-app-activate): Wayland has no portable activation request;
+  // per-desktop backends (GNOME, KDE, wlroots) need their own owner-approved
+  // slice. See `unsupported_activation`.
+  pub fn activate(&self, application_id: &str, settle: std::time::Duration) -> DriverResult<ApplicationActivationResult> {
+    let _ = (self.session, application_id, settle);
+    Err(unsupported_activation(ApplicationIdKind::DesktopAppId))
+  }
 }
 
 impl PermissionApi<'_> {
@@ -94,7 +117,7 @@ impl PermissionApi<'_> {
   pub fn authorize_portals(&self) -> DriverResult<()> {
     let mut state = self.session.state.lock().expect("linux driver session state poisoned");
     let authorization = if state.input_session.is_none() || state.input_backend == crate::InputBackend::Uinput {
-      Some(crate::native::portal::PortalInput::open(state.restore_tokens.as_ref(), state.portal_app_id.as_ref())?)
+      Some(crate::native::portal::InputSession::open(state.restore_tokens.as_ref(), state.portal_app_id.as_ref())?)
     } else {
       None
     };
@@ -323,7 +346,7 @@ impl WindowInput for WindowApi<'_> {
   }
 }
 
-fn add_foreground_window_fallback_reason(result: &mut InputActionResult, unavailable_path: InputDeliveryPath, reason: &str) {
+pub(crate) fn add_foreground_window_fallback_reason(result: &mut InputActionResult, unavailable_path: InputDeliveryPath, reason: &str) {
   if result.fallback_reason().is_none() {
     result.attempts.insert(0, InputAttempt::failure(unavailable_path, reason));
   }

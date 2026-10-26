@@ -11,16 +11,16 @@ use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, S
 use ashpd::desktop::{PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
 use auv_driver_common::error::DriverResult;
-use auv_driver_common::geometry::{Point, Rect};
+use auv_driver_common::geometry::Rect;
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
 use spa::pod::Pod;
 
-use crate::error::{backend, invalid_input};
+use crate::error::backend;
 
 use super::persistence::{RestoreTokenKind, RestoreTokenStore};
-use super::request::{run, session_connection};
+use super::request::{run, run_with_consent, session_connection};
 
 const PIPEWIRE_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 // NOTICE: GNOME's mutter honors the negotiated `maxFramerate` and re-records a
@@ -55,23 +55,6 @@ impl ScreenCastStream {
       return None;
     }
     Some(Rect::new(f64::from(x), f64::from(y), f64::from(width), f64::from(height)))
-  }
-
-  pub fn contains(&self, point: Point) -> bool {
-    self.logical_rect().is_some_and(|rect| {
-      point.x >= rect.origin.x
-        && point.y >= rect.origin.y
-        && point.x <= rect.origin.x + rect.size.width
-        && point.y <= rect.origin.y + rect.size.height
-    })
-  }
-
-  pub fn local_point(&self, point: Point) -> DriverResult<Point> {
-    let rect = self.logical_rect().ok_or_else(|| backend("screencast stream is missing logical position/size"))?;
-    if !self.contains(point) {
-      return Err(invalid_input(format!("point {:?} is outside screencast stream {:?}", point, rect)));
-    }
-    Ok(Point::new(point.x - rect.origin.x, point.y - rect.origin.y))
   }
 }
 
@@ -110,7 +93,7 @@ impl ScreenCastSession {
     };
     let persistent = restore_tokens.is_some() && capture.screencast.version() >= 4;
     let start = |restore: Option<&str>| {
-      run("start screencast session", async {
+      run_with_consent("start screencast session", async {
         let mut options = SelectSourcesOptions::default()
           .set_sources(BitFlags::from(SourceType::Monitor))
           .set_multiple(true)
